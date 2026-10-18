@@ -129,7 +129,7 @@ dh none
 tls-crypt-v2 $STATE_DIR/tls-crypt-v2.key
 verify-client-cert none
 auth SHA256
-auth-user-pass-verify /usr/local/bin/auth.sh file
+auth-user-pass-verify /usr/local/bin/auth.sh via-file
 
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 
@@ -247,10 +247,16 @@ generate_state() {
         log "reusing existing state in $STATE_DIR"
         return 0
     fi
-    # A partial volume is never completed in place: minting a second CA beside an
-    # old cert would produce a state whose certificate no profile can verify.
-    if [ -e "$STATE_DIR" ] && [ -n "$(ls -A "$STATE_DIR" 2>/dev/null)" ]; then
-        log "state in $STATE_DIR is incomplete (missing $(cd "$STATE_DIR" && for f in ca-cert.pem server-cert.pem server-key.pem tls-crypt-v2.key; do [ -s "$f" ] || printf '%s ' "$f"; done))"
+    # A half-written PKI is never completed in place: minting a second CA beside
+    # an old cert produces a state no profile can verify. Only *our* filenames
+    # count — Alpine's openvpn package puts up.sh/down.sh in /etc/openvpn, and a
+    # distro file is not a broken PKI.
+    local f seen=""
+    for f in ca-cert.pem server-cert.pem server-key.pem tls-crypt-v2.key; do
+        [ -e "$STATE_DIR/$f" ] && seen="$seen$f "
+    done
+    if [ -n "$seen" ]; then
+        log "state in $STATE_DIR is incomplete (found $seen, missing the rest)"
         fatal "delete the ovpn-state volume to regenerate, then reissue every client profile"
     fi
     mkdir -p "$STATE_DIR"

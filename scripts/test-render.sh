@@ -138,7 +138,7 @@ case_render() {
     lacks "no bogus verify keyword" "$conf" "tls-crypt-v2 verify"
     has "no client certs"    "$conf" "verify-client-cert none"
     has "auth SHA256"        "$conf" "auth SHA256"
-    has "auth script"        "$conf" "auth-user-pass-verify /usr/local/bin/auth.sh file"
+    has "auth script"        "$conf" "auth-user-pass-verify /usr/local/bin/auth.sh via-file"
     has "AEAD ciphers"       "$conf" "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
     has "client-to-client"   "$conf" "client-to-client"
     has "tcp-nodelay"        "$conf" "tcp-nodelay"
@@ -369,7 +369,17 @@ case_keys() {
     # a half-populated volume must not be mistaken for a complete one
     rm -f "$t/state/server-key.pem"
     run_is "partial state is refused" 2 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
-    rm -rf "$t"
+
+    # but unrelated files must NOT: Alpine's openvpn package ships up.sh and
+    # down.sh into /etc/openvpn, and a distro file is not a broken PKI
+    local t3; t3="$(mktemp -d)"
+    mkdir -p "$t3/state"
+    printf '#!/bin/sh\n' > "$t3/state/up.sh"
+    run_is "unrelated files do not block generation" 0 \
+        env "${FIX_ENV[@]}" PATH="$t/bin:$PATH" STATE_DIR="$t3/state" \
+            OVPN_DIR="$t3/ovpn" SINGBOX_CONF="$t3/sb/config.json" \
+            BOOT_STAGE=keys-only bash "$ENTRY"
+    rm -rf "$t" "$t3"
 }
 
 main_cases() { case_cidr; case_validate; case_render; case_auth; case_keys; case_report; }
@@ -382,8 +392,7 @@ state_case() {
     # so a single-quoted $vol would be unbound by then.
     trap "docker volume rm -f '$vol' >/dev/null 2>&1 || true" EXIT
     run_is "keys-only first boot" 0 \
-        image_run -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
-            -e BOOT_STAGE=keys-only \
+        image_run -v "$vol":/etc/openvpn/state -e BOOT_STAGE=keys-only \
             --entrypoint /usr/local/bin/entrypoint.sh "$IMG"
     has "state generated" "$LAST_OUT" "state generated"
 
@@ -418,9 +427,12 @@ state_case() {
         docker run --rm --entrypoint /bin/sh "$IMG" -c 'command -v report.sh'
     # and the users file must be readable by the uid openvpn drops to
     run_is "users file readable as nobody" 0 \
-        docker run --rm --user nobody -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
-            --entrypoint /bin/sh "$IMG" \
-            -c 'head -1 /etc/openvpn/users || { echo "--- id ---"; id; echo "--- ls ---"; ls -lan /etc/openvpn; exit 1; }'
+        docker run --rm --cap-add NET_ADMIN -v "$vol":/etc/openvpn/state \
+            -e BOOT_STAGE=keys-only "${FIX_DE[@]}" \
+            --entrypoint /bin/sh "$IMG" -c \
+            '/usr/local/bin/entrypoint.sh &&
+             su nobody -s /bin/sh -c "head -1 /etc/openvpn/users" ||
+             { echo "--- id ---"; id; ls -lan /etc/openvpn; exit 1; }'
 
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
