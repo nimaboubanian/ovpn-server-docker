@@ -13,8 +13,8 @@ ENTRY="$HERE/entrypoint.sh"
 fail=0
 LAST_OUT=""
 
-PASS1='alice:s3cret'
-PASS2='bob:hunter2'
+PASS1='s3cret'
+PASS2='hunter2'
 
 # One baseline for every case; docker-mode -e flags are appended after it, and
 # env applies left to right, so a case's own overrides win.
@@ -66,10 +66,11 @@ lacks() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF -
 
 # run_is name want cmd... — run the command as real argv, compare exit code
 run_is() {
-    local name="$1" want="$2" rc=0
+    local name="$1" want="$2" rc=0 _tmp
     shift 2
-    set +e; "$@" >/tmp/ovpn-out.$$ 2>&1; rc=$?
-    LAST_OUT="$(cat /tmp/ovpn-out.$$)"; rm -f /tmp/ovpn-out.$$ || true
+    _tmp="$(mktemp)"
+    set +e; "$@" > "$_tmp" 2>&1; rc=$?
+    LAST_OUT="$(cat "$_tmp")"; rm -f "$_tmp"
     if [ "$rc" = "$want" ]; then
         echo "$name: PASS (exit $rc)"
     else

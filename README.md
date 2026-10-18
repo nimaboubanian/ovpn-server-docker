@@ -110,6 +110,12 @@ at the kernel default.
 client on a UDP-blocked network cannot connect at all, check the firewall
 before anything else — nothing about OpenVPN is UDP-specific.
 
+**Container shows healthy but no clients can connect.** The healthcheck is a
+TCP connect: it passes as soon as openvpn holds the socket, even if the process
+is stuck and not completing handshakes. `docker compose exec vpndogs-ovpn-inbound
+report.sh` shows the real state — process liveness, interface status, and the
+`ROUTING TABLE` of connected clients.
+
 **Handshake fails with a certificate error after the volume was recreated.**
 Losing `ovpn-state` mints a new CA, server certificate and `tls-crypt-v2`
 server key, and every previously issued profile is dead — each profile's client

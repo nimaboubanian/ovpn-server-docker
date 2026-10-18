@@ -196,8 +196,7 @@ render_client_conf() {
                   --genkey tls-crypt-v2-client "$tc"; then
         rm -f "$tc"; fatal "client-conf: could not generate a tls-crypt-v2 client key"
     fi
-    local tc_body; tc_body="$(cat "$tc")"
-    rm -f "$tc"
+    local tc_body; tc_body="$(cat "$tc")"; rm -f "$tc"
     cat <<EOF
 client
 dev tun
@@ -253,7 +252,7 @@ generate_state() {
     # distro file is not a broken PKI.
     local f seen=""
     for f in ca-cert.pem server-cert.pem server-key.pem tls-crypt-v2.key; do
-        [ -e "$STATE_DIR/$f" ] && seen="$seen$f "
+        [ -s "$STATE_DIR/$f" ] && seen="$seen$f "
     done
     if [ -n "$seen" ]; then
         log "state in $STATE_DIR is incomplete (found $seen, missing the rest)"
