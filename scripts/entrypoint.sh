@@ -46,6 +46,7 @@ is_ipv4_addr() {
 parse_users() {
     local -a entries=()
     local entry name pass seen_names=" "
+    USERS=()
     IFS=',' read -r -a entries <<<"${OVPN_USERS:-}"
     for entry in "${entries[@]}"; do
         [[ "$entry" == *:* ]] || fatal "OVPN_USERS entry without ':' — expected name:password, got '$entry' (passwords may contain ':' but not ',')"
@@ -70,6 +71,9 @@ validate_env() {
     [[ -n "${VPN_SERVER_ADDR:-}" ]] || fatal "VPN_SERVER_ADDR is required — the public address clients dial; it becomes the certificate CN and SAN"
     [[ "$CHAIN_SOCKS_PORT" =~ ^[0-9]+$ ]] || fatal "CHAIN_SOCKS_PORT must be a port number, got '$CHAIN_SOCKS_PORT'"
     is_ipv4_cidr "$OVPN_POOL" || fatal "OVPN_POOL is not a valid CIDR, got '$OVPN_POOL'"
+    # openvpn hands clients addresses out of the pool: /31 and /32 leave none,
+    # so the node would come up and serve nobody.
+    (( ${OVPN_POOL##*/} <= 30 )) || fatal "OVPN_POOL $OVPN_POOL is too small to hand out client addresses (use /30 or larger)"
     is_ipv4_addr "$CLIENT_DNS" || fatal "CLIENT_DNS is not a valid IPv4 address, got '$CLIENT_DNS'"
     parse_users
 }
@@ -99,9 +103,127 @@ cidr_overlap() { # exit 0 when the two CIDRs share any address
     (( (diff & ma) == 0 || (diff & mb) == 0 ))
 }
 
+# --- renderers ---------------------------------------------------------------
+
+prefix_to_netmask() { # dotted-quad mask for a CIDR's prefix length
+    local m=$(( 0xFFFFFFFF << (32 - ${1##*/}) & 0xFFFFFFFF ))
+    printf '%d.%d.%d.%d\n' $(( (m >> 24) & 0xFF )) $(( (m >> 16) & 0xFF )) $(( (m >> 8) & 0xFF )) $(( m & 0xFF ))
+}
+
+# Kept free of comments on purpose: the suite asserts the ABSENCE of several
+# substrings ("ca ", "compress", "fragment"), and prose in here would trip them.
+render_server_conf() {
+    cat <<EOF
+proto tcp-server
+port $LISTEN_PORT
+dev tun
+topology subnet
+server ${OVPN_POOL%%/*} $(prefix_to_netmask "$OVPN_POOL")
+ifconfig-pool-persist $STATE_DIR/ipp.txt
+tun-mtu 1500
+
+cert $STATE_DIR/server-cert.pem
+key $STATE_DIR/server-key.pem
+dh none
+tls-crypt-v2 verify $STATE_DIR/tls-crypt-v2.key
+verify-client-cert none
+auth SHA256
+auth-user-pass-verify /usr/local/bin/auth.sh file
+
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+
+client-to-client
+keepalive 10 60
+tcp-nodelay
+persist-key
+persist-tun
+explicit-exit-notify 1
+
+status $OVPN_DIR/status.log 30
+status-version 1
+verb 3
+
+user nobody
+group nobody
+
+push "redirect-gateway def1 bypass-dhcp ipv6"
+push "dhcp-option DNS $CLIENT_DNS"
+EOF
+}
+
+render_singbox_conf() {
+    jq -n \
+        --arg tun "$TUN_CHAIN" \
+        --arg host "$CHAIN_SOCKS_HOST" \
+        --argjson port "$CHAIN_SOCKS_PORT" \
+        '{
+          log: {level: "warn"},
+          inbounds: [{
+            type: "tun", tag: "tun-in", interface_name: $tun,
+            address: ["198.18.0.1/30"], mtu: 1500,
+            auto_route: false, strict_route: false
+          }],
+          outbounds: [
+            {type: "socks", tag: "chain-out", server: $host, server_port: $port}
+          ],
+          route: {final: "chain-out"}
+        }'
+}
+
+render_users_file() {
+    local entry
+    for entry in "${USERS[@]}"; do
+        printf '%s:%s\n' "${entry%%$'\t'*}" "${entry#*$'\t'}"
+    done
+}
+
+render_client_conf() {
+    local user="${1:-}" entry name found="" names=""
+    for entry in "${USERS[@]}"; do
+        name="${entry%%$'\t'*}"
+        names+="$name "
+        [ "$name" = "$user" ] && found=1
+    done
+    [[ -n "$found" ]] || fatal "client-conf: '$user' is not in OVPN_USERS (known: $names)"
+    cat <<EOF
+client
+dev tun
+proto tcp-client
+remote $VPN_SERVER_ADDR $LISTEN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+route-ipv6
+remote-cert-tls server
+auth-user-pass
+auth-nocache
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+verb 3
+
+<ca>
+$( [ -s "$STATE_DIR/ca-cert.pem" ] && cat "$STATE_DIR/ca-cert.pem" || echo "# placeholder: CA not generated yet" )
+</ca>
+<tls-crypt-v2>
+$( [ -s "$STATE_DIR/tls-crypt-v2.key" ] && cat "$STATE_DIR/tls-crypt-v2.key" || echo "# placeholder: key not generated yet" )
+</tls-crypt-v2>
+EOF
+}
+
+cmd_render() {
+    validate_env
+    echo "# === server.conf ==="; render_server_conf
+    echo "# === sing-box.json ==="; render_singbox_conf
+    echo "# === users ==="; render_users_file
+}
+
+cmd_client_conf() { validate_env; render_client_conf "$@"; }
+
 # Only the branches a task has implemented get a case. An absent branch falls
 # through and exits 0, which is what the RED run before validate_env needs.
 case "${1:-}" in
-    selftest-cidr) shift; cidr_overlap "$@" ;;
-    *)             validate_env; log "environment OK (${#USERS[@]} user(s))" ;;
+    render)         cmd_render ;;
+    client-conf)    shift; cmd_client_conf "$@" ;;
+    selftest-cidr)  shift; cidr_overlap "$@" ;;
+    *)              validate_env; log "environment OK (${#USERS[@]} user(s))" ;;
 esac
