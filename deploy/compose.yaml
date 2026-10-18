@@ -8,7 +8,6 @@ services:
     image: nimaboubanian/openvpn-server
     container_name: vpndogs-ovpn-inbound
     profiles: ["ovpn-inbound"]
-    networks: [vpndogs]
     ports:
       - "1064:1064/tcp"
     cap_add:
@@ -45,6 +44,7 @@ services:
     depends_on:
       vpndogs-router:
         condition: service_healthy
+    networks: [vpndogs]
     restart: unless-stopped
 
 volumes:
