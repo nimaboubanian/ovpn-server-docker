@@ -59,8 +59,10 @@ assert() { # name jq-filter json
 }
 
 eq() { local name="$1" got="$2" want="$3"; [ "$got" = "$want" ] && echo "$name: PASS" || { echo "$name: FAIL"; printf 'want:\n%s\n\ngot:\n%s\n' "$want" "$got" >&2; fail=1; }; }
-has() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF "$pat" && echo "$name: PASS" || { echo "$name: FAIL"; printf 'expected %q in:\n%s\n' "$pat" "$text" >&2; fail=1; }; }
-lacks() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF "$pat" && { echo "$name: FAIL"; printf 'found %q in:\n%s\n' "$pat" "$text" >&2; fail=1; } || echo "$name: PASS"; }
+# `--` is load-bearing: a pattern like "-- BEGIN CERTIFICATE --" is otherwise
+# swallowed by grep's option parsing and can never match.
+has() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF -- "$pat" && echo "$name: PASS" || { echo "$name: FAIL"; printf 'expected %q in:\n%s\n' "$pat" "$text" >&2; fail=1; }; }
+lacks() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF -- "$pat" && { echo "$name: FAIL"; printf 'found %q in:\n%s\n' "$pat" "$text" >&2; fail=1; } || echo "$name: PASS"; }
 
 # run_is name want cmd... — run the command as real argv, compare exit code
 run_is() {
@@ -98,8 +100,10 @@ case_validate() {
     run_is "comma in password" 2 run_env "OVPN_USERS=alice:a,b"
     run_is "newline in password" 2 run_env "$(printf 'OVPN_USERS=alice:a\nb')"
     # the positive half of Review Focus 1: colons in a password are legal and
-    # must survive parsing, not just be rejected when they look wrong
-    run_is "password with colons" 0 run_env "OVPN_USERS=alice:a:b:c"
+    # must survive parsing, not just be rejected when they look wrong.
+    # `render`, not a bare boot: the exit-0 contract here is validation, and a
+    # bare invocation now goes on to generate state and start daemons.
+    run_is "password with colons" 0 run_env "OVPN_USERS=alice:a:b:c" render
     run_is "missing VPN_SERVER_ADDR" 2 run_env "OVPN_USERS=alice:$PASS1" "VPN_SERVER_ADDR="
     run_is "bad OVPN_POOL" 2 run_env "OVPN_USERS=alice:$PASS1" "OVPN_POOL=notacidr"
     run_is "bad OVPN_POOL prefix" 2 run_env "OVPN_USERS=alice:$PASS1" "OVPN_POOL=10.0.0.0/33"
@@ -107,7 +111,7 @@ case_validate() {
     run_is "bad OVPN_POOL prefix high" 2 run_env "OVPN_USERS=alice:$PASS1" "OVPN_POOL=10.0.0.0/31"
     run_is "bad CLIENT_DNS" 2 run_env "OVPN_USERS=alice:$PASS1" "CLIENT_DNS=999.1.1.1"
     run_is "bad CHAIN_SOCKS_PORT" 2 run_env "OVPN_USERS=alice:$PASS1" "CHAIN_SOCKS_PORT=abc"
-    run_is "valid config boots" 0 run_env "OVPN_USERS=alice:$PASS1" "OVPN_POOL=10.99.0.0/24"
+    run_is "valid config validates" 0 run_env "OVPN_USERS=alice:$PASS1" "OVPN_POOL=10.99.0.0/24" render
     # container logs get pasted into issue trackers; a fatal that echoes a
     # password leaks it. The bad-charset entry carries a distinct password so a
     # match on PASS1 cannot hide a leak.
@@ -203,7 +207,99 @@ case_client() {
     has "unknown user named"     "$LAST_OUT" "nobody"
 }
 
-main_cases() { case_cidr; case_validate; case_render; case_client; }
+AUTH="$HERE/auth.sh"
+
+# auth.sh runs on the host too: it is four lines of sh and grep, and shipping a
+# password comparison nobody ever executed would be the worst trade in this repo.
+case_auth() {
+    echo "=== AUTH CASES ==="
+    local dir cred; dir="$(mktemp -d)"; cred="$dir/cred"
+    printf 'alice:s3cret\nbob:hunter2\ndave:p.*ss\neve:a:b:c\n' > "$dir/users"
+    local pair user pass want
+    while IFS=' ' read -r user pass want; do
+        printf '%s\n%s\n' "$user" "$pass" > "$cred"
+        run_is "auth $user / $pass" "$want" env USERS_FILE="$dir/users" sh "$AUTH" "$cred"
+    done <<'PAIRS'
+alice s3cret 0
+alice wrongpw 1
+bob hunter2 0
+carol whatever 1
+dave p.*ss 0
+eve a:b:c 0
+PAIRS
+    printf 'alice\n\n' > "$cred"
+    run_is "empty password rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH" "$cred"
+    # openvpn writes the credential file without a trailing newline; both
+    # shapes have to authenticate
+    printf 'alice\ns3cret' > "$cred"
+    run_is "no trailing newline accepts" 0 env USERS_FILE="$dir/users" sh "$AUTH" "$cred"
+    # Review Focus 2: a newline inside the credential file must fail closed, not
+    # partially match. `tr '\n' ':'` joins every line, so the lookup cannot hit.
+    printf 'alice\na\nb\n' > "$cred"
+    run_is "newline credential rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH" "$cred"
+    run_is "no argument rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH"
+    run_is "unreadable file rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH" /nonexistent
+    rm -rf "$dir"
+}
+
+# render_client_conf must inline whatever is really in STATE_DIR, not a marker.
+case_client_ca() {
+    echo "=== CLIENT-CONF REAL PKI CASES ==="
+    local dir; dir="$(mktemp -d)"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
+        -keyout "$dir/server-key.pem" -out "$dir/ca-cert.pem" \
+        -subj "/CN=test" >/dev/null 2>&1
+    printf -- '-----BEGIN OpenVPN Static key V1-----\ndeadbeef\n-----END OpenVPN Static key V1-----\n' \
+        > "$dir/tls-crypt-v2.key"
+    local ovpn; ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)"
+    has "real CA inlined"        "$ovpn" "-----BEGIN CERTIFICATE-----"
+    has "real CA body present"   "$ovpn" "$(awk 'NR==2' "$dir/ca-cert.pem")"
+    has "real tls-crypt inlined" "$ovpn" "deadbeef"
+    rm -rf "$dir"
+}
+
+main_cases() { case_cidr; case_validate; case_render; case_client; case_auth; case_client_ca; }
+
+state_case() {
+    echo "=== PKI STATE CASES ==="
+    local vol="ovpn-state-test-$$"
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+    run_is "keys-only first boot" 0 \
+        image_run -v "$vol":/etc/openvpn/state -e BOOT_STAGE=keys-only \
+            --entrypoint /usr/local/bin/entrypoint.sh "$IMG"
+    has "state generated" "$LAST_OUT" "state generated"
+
+    local listing; listing="$(docker run --rm -v "$vol":/etc/openvpn/state \
+        --entrypoint /bin/sh "$IMG" -c 'ls /etc/openvpn/state')"
+    has "ca-cert.pem present"     "$listing" "ca-cert.pem"
+    has "server-cert.pem present" "$listing" "server-cert.pem"
+    has "server-key.pem present"  "$listing" "server-key.pem"
+    has "tls-crypt-v2.key present" "$listing" "tls-crypt-v2.key"
+    lacks "CA KEY IS GONE" "$listing" "ca-key.pem"
+
+    # serverAuth EKU and the SAN are load-bearing, not decoration: without the
+    # EKU every handshake is refused, and without the SAN remote-cert-tls fails.
+    local cert; cert="$(docker run --rm -v "$vol":/etc/openvpn/state \
+        --entrypoint /bin/sh "$IMG" \
+        -c 'openssl x509 -in /etc/openvpn/state/server-cert.pem -noout -text')"
+    has "server cert has serverAuth EKU" "$cert" "TLS Web Server Authentication"
+    has "server cert SAN is the VPN address" "$cert" "DNS:vpn.example.com"
+
+    local fp1 fp2
+    fp1="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
+        -c 'cat /etc/openvpn/state/server-cert.pem')"
+    run_is "keys-only second boot" 0 \
+        image_run -v "$vol":/etc/openvpn/state -e BOOT_STAGE=keys-only "$IMG"
+    has "reuse logged" "$LAST_OUT" "reusing existing state"
+    fp2="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
+        -c 'cat /etc/openvpn/state/server-cert.pem')"
+    eq "certificate identical across boots" "$fp1" "$fp2"
+
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
+boot_cases() { state_case; }
 
 [ "$MODE" = local ] && {
     echo "=== LOCAL RENDER TESTS ==="
@@ -213,4 +309,5 @@ main_cases() { case_cidr; case_validate; case_render; case_client; }
 
 echo "=== DOCKER MODE TESTS ==="
 main_cases
+boot_cases
 exit "$fail"

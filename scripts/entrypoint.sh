@@ -19,6 +19,7 @@ LISTEN_PORT=1064
 STATE_DIR="${STATE_DIR:-/etc/openvpn/state}"
 OVPN_DIR="${OVPN_DIR:-/etc/openvpn}"
 USERS_FILE="${USERS_FILE:-$OVPN_DIR/users}"
+SINGBOX_CONF="${SINGBOX_CONF:-/etc/sing-box/config.json}"
 ROUTER_TABLE=200
 TUN_VPN="tun0"     # owned by openvpn
 TUN_CHAIN="tun1"   # owned by sing-box
@@ -219,11 +220,60 @@ cmd_render() {
 
 cmd_client_conf() { validate_env; render_client_conf "$@"; }
 
+# --- state ------------------------------------------------------------------
+
+generate_state() {
+    if [ -s "$STATE_DIR/ca-cert.pem" ] && [ -s "$STATE_DIR/tls-crypt-v2.key" ]; then
+        log "reusing existing state in $STATE_DIR"
+        return 0
+    fi
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    local tmp; tmp="$(mktemp -d)"
+    # SAN type follows VPN_SERVER_ADDR: iPAddress for a literal, dNSName for a name.
+    local san_type=DNS
+    is_ipv4_addr "$VPN_SERVER_ADDR" && san_type=IP
+    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -sha256 \
+        -keyout "$tmp/ca-key.pem" -out "$STATE_DIR/ca-cert.pem" \
+        -subj "/C=CH/O=vpndogs/CN=vpndogs OpenVPN CA" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:0" >/dev/null 2>&1
+    openssl req -newkey rsa:3072 -nodes -keyout "$STATE_DIR/server-key.pem" \
+        -out "$tmp/server.csr" -subj "/C=CH/O=vpndogs/CN=${VPN_SERVER_ADDR}" >/dev/null 2>&1
+    openssl x509 -req -in "$tmp/server.csr" -CA "$STATE_DIR/ca-cert.pem" \
+        -CAkey "$tmp/ca-key.pem" -CAcreateserial -days 1095 -sha256 \
+        -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s:%s\n' \
+            "$san_type" "$VPN_SERVER_ADDR") \
+        -out "$STATE_DIR/server-cert.pem" >/dev/null 2>&1
+    # The CA key has issued its one and only certificate; it is never needed again.
+    rm -rf "$tmp"
+    openvpn --genkey secret "$STATE_DIR/tls-crypt-v2.key"
+    chmod 600 "$STATE_DIR/server-key.pem" "$STATE_DIR/tls-crypt-v2.key"
+    log "state generated in $STATE_DIR (CN/SAN=${VPN_SERVER_ADDR}, CA key discarded)"
+}
+
+render_configs() {
+    mkdir -p "$OVPN_DIR"
+    render_server_conf  > "$OVPN_DIR/server.conf"
+    render_singbox_conf > "$SINGBOX_CONF"
+    render_users_file   > "$USERS_FILE"
+    chmod 600 "$OVPN_DIR/server.conf" "$USERS_FILE"
+    sing-box check -c "$SINGBOX_CONF"
+}
+
+main() {
+    validate_env
+    generate_state
+    render_configs
+    if [ "${BOOT_STAGE:-}" = keys-only ]; then exit 0; fi
+    log "boot path lands in the next task"
+    exit 0
+}
+
 # Only the branches a task has implemented get a case. An absent branch falls
 # through and exits 0, which is what the RED run before validate_env needs.
 case "${1:-}" in
     render)         cmd_render ;;
     client-conf)    shift; cmd_client_conf "$@" ;;
     selftest-cidr)  shift; cidr_overlap "$@" ;;
-    *)              validate_env; log "environment OK (${#USERS[@]} user(s))" ;;
+    *)              main ;;
 esac
