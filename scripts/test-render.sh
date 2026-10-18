@@ -330,7 +330,32 @@ boot_case() {
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
-boot_cases() { state_case; boot_case; }
+report_case() {
+    echo "=== REPORT CASES ==="
+    local vol="ovpn-report-test-$$" out key tc
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+    run_is "seed state for report" 0 \
+        docker run --rm -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
+            -e BOOT_STAGE=keys-only "${FIX_DE[@]}" \
+            --entrypoint /usr/local/bin/entrypoint.sh "$IMG"
+    out="$(docker run --rm -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
+        "${FIX_DE[@]}" --entrypoint /bin/sh "$IMG" -c 'report.sh' 2>&1)"
+    key="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
+        -c 'cat /etc/openvpn/state/server-key.pem')"
+    tc="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
+        -c 'cat /etc/openvpn/state/tls-crypt-v2.key')"
+    has "reports the tunnel"     "$out" "== OpenVPN =="
+    has "shows the public CA"    "$out" "-----BEGIN CERTIFICATE-----"
+    has "tells you the next cmd" "$out" "client-conf"
+    lacks "hides server key"     "$out" "$key"
+    lacks "hides tls-crypt key"  "$out" "$tc"
+    lacks "hides alice password" "$out" "$PASS1"
+    lacks "hides bob password"   "$out" "$PASS2"
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
+boot_cases() { state_case; boot_case; report_case; }
 
 [ "$MODE" = local ] && {
     echo "=== LOCAL RENDER TESTS ==="
