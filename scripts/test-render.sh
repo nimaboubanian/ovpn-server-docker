@@ -134,7 +134,8 @@ case_render() {
     has "pool persist"       "$conf" "ifconfig-pool-persist /etc/openvpn/state/ipp.txt"
     has "tun-mtu 1500"       "$conf" "tun-mtu 1500"
     has "dh none"            "$conf" "dh none"
-    has "tls-crypt-v2 key"  "$conf" "tls-crypt-v2 /etc/openvpn/state/tls-crypt-v2.key"
+    has "ca cert"            "$conf" "ca /etc/openvpn/state/ca-cert.pem"
+    has "tls-crypt-v2 key"   "$conf" "tls-crypt-v2 /etc/openvpn/state/tls-crypt-v2.key"
     lacks "no bogus verify keyword" "$conf" "tls-crypt-v2 verify"
     has "no client certs"    "$conf" "verify-client-cert none"
     has "auth SHA256"        "$conf" "auth SHA256"
@@ -145,7 +146,6 @@ case_render() {
     has "persist-key"        "$conf" "persist-key"
     has "persist-tun"        "$conf" "persist-tun"
     has "keepalive"          "$conf" "keepalive 10 60"
-    has "explicit-exit"      "$conf" "explicit-exit-notify 1"
     has "drop privs user"    "$conf" "user nobody"
     has "drop privs group"   "$conf" "group nobody"
     has "redirect ipv4+ipv6" "$conf" 'push "redirect-gateway def1 bypass-dhcp ipv6"'
@@ -153,13 +153,14 @@ case_render() {
     has "status file"        "$conf" "status /etc/openvpn/status.log 30"
     has "status version 1"   "$conf" "status-version 1"
 
-    lacks "NO ca directive"          "$conf" "ca "
     lacks "NO compress"               "$conf" "compress"
     lacks "NO mssfix"                 "$conf" "mssfix"
     lacks "NO fragment"               "$conf" "fragment"
     lacks "NO data-ciphers-fallback"  "$conf" "data-ciphers-fallback"
     lacks "NO bare cipher"            "$conf" "cipher "
     lacks "NO client-config-dir"      "$conf" "client-config-dir"
+    # UDP-transport-only: openvpn notices it and ignores it on a TCP listener
+    lacks "NO explicit-exit-notify"   "$conf" "explicit-exit-notify"
     lacks "NO allow-compression"      "$conf" "allow-compression"
 
     has "users alice"  "$users" "alice:$PASS1"
@@ -450,13 +451,17 @@ boot_case() {
             "${FIX_DE[@]}" \
             --entrypoint /bin/sh "$IMG" -c \
             '/usr/local/bin/entrypoint.sh 2>&1 &&
-             ip link show tun0 && ip link show tun1 &&
-             pgrep -x openvpn && pgrep -x sing-box &&
+             ip link show tun0 >/dev/null && echo MARK-TUN0 &&
+             ip link show tun1 >/dev/null && echo MARK-TUN1 &&
+             pgrep -x openvpn  >/dev/null && echo MARK-OPENVPN &&
+             pgrep -x sing-box >/dev/null && echo MARK-SINGBOX &&
              ip rule && ip route show table 200'
-    has "tun0 up"      "$LAST_OUT" "tun0"
-    has "tun1 up"      "$LAST_OUT" "tun1"
-    has "openvpn running"  "$LAST_OUT" "openvpn"
-    has "sing-box running" "$LAST_OUT" "sing-box"
+    # Explicit markers, not substring hunts: a failed boot still prints
+    # 'Device "tun0" does not exist', which a `has "tun0"` would match.
+    has "tun0 up"         "$LAST_OUT" "MARK-TUN0"
+    has "tun1 up"         "$LAST_OUT" "MARK-TUN1"
+    has "openvpn running"  "$LAST_OUT" "MARK-OPENVPN"
+    has "sing-box running" "$LAST_OUT" "MARK-SINGBOX"
     has "policy rule"  "$LAST_OUT" "from 10.10.40.0/24 lookup 200"
     has "default into chain tun" "$LAST_OUT" "default dev tun1"
 

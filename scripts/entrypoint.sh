@@ -112,7 +112,7 @@ prefix_to_netmask() { # dotted-quad mask for a CIDR's prefix length
 }
 
 # Kept free of comments on purpose: the suite asserts the ABSENCE of several
-# substrings ("ca ", "compress", "fragment"), and prose in here would trip them.
+# substrings ("compress", "fragment"), and prose in here would trip them.
 render_server_conf() {
     cat <<EOF
 proto tcp-server
@@ -125,6 +125,7 @@ tun-mtu 1500
 
 cert $STATE_DIR/server-cert.pem
 key $STATE_DIR/server-key.pem
+ca $STATE_DIR/ca-cert.pem
 dh none
 tls-crypt-v2 $STATE_DIR/tls-crypt-v2.key
 verify-client-cert none
@@ -138,7 +139,6 @@ keepalive 10 60
 tcp-nodelay
 persist-key
 persist-tun
-explicit-exit-notify 1
 
 status $OVPN_DIR/status.log 30
 status-version 1
