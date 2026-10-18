@@ -1,0 +1,41 @@
+networks:
+  vpndogs: { name: vpndogs }
+
+services:
+  ovpn:
+    build: { context: ., network: host }
+    image: openvpn-server:latest
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      # forwarding is required: openvpn decapsulates into the container netns
+      # and the policy route forwards tun0 -> tun1 in the kernel
+      net.ipv4.ip_forward: "1"
+      # rp_filter drops openvpn-decapped packets: their source (the VPN pool)
+      # has no reverse path in the main table
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    ports:
+      - "1064:1064/tcp"
+    environment:
+      OVPN_USERS: ${OVPN_USERS:-}
+      OVPN_POOL: ${OVPN_POOL:-10.10.40.0/24}
+      VPN_SERVER_ADDR: ${VPN_SERVER_ADDR:-}
+      CLIENT_DNS: ${CLIENT_DNS:-1.1.1.1}
+      CHAIN_SOCKS_HOST: ${CHAIN_SOCKS_HOST:-vpndogs-router}
+      CHAIN_SOCKS_PORT: ${CHAIN_SOCKS_PORT:-1070}
+    networks: [vpndogs]
+    volumes:
+      - ovpn-state:/etc/openvpn/state
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/1064"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  ovpn-state: {}
