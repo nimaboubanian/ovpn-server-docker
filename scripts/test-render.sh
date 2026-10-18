@@ -299,7 +299,38 @@ state_case() {
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
-boot_cases() { state_case; }
+boot_case() {
+    echo "=== BOOT CASES ==="
+    local vol="ovpn-boot-test-$$"
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+    run_is "live boot" 0 \
+        docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
+            -v "$vol":/etc/openvpn/state -e BOOT_STAGE=up-only \
+            "${FIX_DE[@]}" \
+            --entrypoint /bin/sh "$IMG" -c \
+            '/usr/local/bin/entrypoint.sh 2>&1 &&
+             ip link show tun0 && ip link show tun1 &&
+             pgrep -x openvpn && pgrep -x sing-box &&
+             ip rule && ip route show table 200'
+    has "tun0 up"      "$LAST_OUT" "tun0"
+    has "tun1 up"      "$LAST_OUT" "tun1"
+    has "openvpn running"  "$LAST_OUT" "openvpn"
+    has "sing-box running" "$LAST_OUT" "sing-box"
+    has "policy rule"  "$LAST_OUT" "from 10.10.40.0/24 lookup 200"
+    has "default into chain tun" "$LAST_OUT" "default dev tun1"
+
+    # Review Focus 4: decrypted traffic looping back into the netns is a silent
+    # black hole, so an overlapping pool must stop the boot.
+    run_is "pool overlap fatal" 2 \
+        docker run --rm --cap-add NET_ADMIN -e BOOT_STAGE=up-only \
+            -e OVPN_POOL=172.17.0.0/16 "${FIX_DE[@]}" "$IMG"
+    has "overlap message" "$LAST_OUT" "overlaps"
+
+    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+}
+
+boot_cases() { state_case; boot_case; }
 
 [ "$MODE" = local ] && {
     echo "=== LOCAL RENDER TESTS ==="

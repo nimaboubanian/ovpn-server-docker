@@ -262,10 +262,113 @@ render_configs() {
 
 main() {
     validate_env
+    guard_pool_subnet
     generate_state
     render_configs
     if [ "${BOOT_STAGE:-}" = keys-only ]; then exit 0; fi
-    log "boot path lands in the next task"
+    start_openvpn
+    start_singbox
+    install_routes
+    if [ "${BOOT_STAGE:-}" = up-only ]; then exit 0; fi
+    supervise
+}
+
+# --- boot -------------------------------------------------------------------
+# Boot order: openvpn first, then sing-box. It is the reverse of the siblings',
+# and the reason is which process claims which interface name: openvpn creates
+# tun0 itself from its own `dev tun` + `server` directive, so sing-box is the one
+# that has to be told its name (`interface_name: tun1`).
+
+declare -A CHILD_PIDS=()
+
+child_dead() { ! kill -0 "${CHILD_PIDS[$1]}" 2>/dev/null; }
+
+wait_for() { # wait_for <seconds> <cmd...>
+    local deadline=$(( SECONDS + $1 ))
+    shift
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        "$@" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# A pool inside the container's own subnet would make decrypted traffic route
+# back into the same netns instead of the tun — a black hole, silently.
+guard_pool_subnet() {
+    local cidr
+    while read -r cidr; do
+        if cidr_overlap "$cidr" "$OVPN_POOL"; then
+            fatal "OVPN_POOL $OVPN_POOL overlaps the container's own subnet $cidr" \
+                "— pick a pool outside it (container subnets: $(ip -4 -o addr show scope global | awk '{print $4}' | paste -sd, -))"
+        fi
+    done < <(ip -4 -o addr show scope global | awk '{print $4}')
+}
+
+start_openvpn() {
+    openvpn --config "$OVPN_DIR/server.conf" &
+    CHILD_PIDS[openvpn]=$!
+    wait_for 15 ip link show "$TUN_VPN" \
+        || { log "FATAL: $TUN_VPN never came up — check /dev/net/tun in compose"; exit 1; }
+    log "openvpn up, $TUN_VPN ready"
+}
+
+start_singbox() {
+    sing-box run -c "$SINGBOX_CONF" &
+    CHILD_PIDS[sing-box]=$!
+    wait_for 15 ip link show "$TUN_CHAIN" \
+        || { log "FATAL: $TUN_CHAIN never came up — check /dev/net/tun in compose"; exit 1; }
+    log "sing-box up, $TUN_CHAIN ready"
+}
+
+# Policy routing, not auto_route: only decrypted pool-source traffic enters the
+# tun. openvpn's own TCP socket and sing-box's SOCKS traffic keep the normal
+# route. Idempotent, so it runs again after every sing-box restart.
+install_routes() {
+    ip rule del from "$OVPN_POOL" lookup "$ROUTER_TABLE" 2>/dev/null || true
+    ip rule add from "$OVPN_POOL" lookup "$ROUTER_TABLE"
+    ip route replace default dev "$TUN_CHAIN" table "$ROUTER_TABLE"
+    log "ip rule from $OVPN_POOL lookup $ROUTER_TABLE + default dev $TUN_CHAIN installed"
+}
+
+restart_child() {
+    case "$1" in
+        # a fresh tun needs its route back, or decrypted traffic is dropped
+        sing-box) start_singbox && install_routes ;;
+        # openvpn recreates tun0 and reapplies its own `server` directive, so the
+        # connected route returns with it; sing-box's tun never died
+        openvpn)  start_openvpn ;;
+    esac
+}
+
+supervise() {
+    local deaths=0 name
+    trap 'shutdown' TERM INT
+    while true; do
+        wait -n 2>/dev/null || true
+        for name in "${!CHILD_PIDS[@]}"; do
+            child_dead "$name" || continue
+            deaths=$((deaths + 1))
+            log "child '$name' died (deaths since boot: $deaths) — restarting"
+            restart_child "$name" || exit 1
+            # Counted per container lifetime, not per "child looked healthy"
+            # check: a daemon that crashes, restarts, survives past the grace
+            # period and crashes again would reset that counter forever and
+            # flap while the healthcheck stayed green.
+            if [ "$deaths" -ge 3 ]; then
+                log "FATAL: $deaths child deaths since boot — giving up"
+                exit 1
+            fi
+        done
+    done
+}
+
+shutdown() {
+    log "shutting down"
+    local pid
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
     exit 0
 }
 
