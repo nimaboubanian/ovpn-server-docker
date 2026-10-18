@@ -49,6 +49,25 @@ echo "  docker exec vpndogs-ovpn-inbound entrypoint.sh client-conf <user> > <use
 echo "  Profiles carry no password: the client prompts on connect."
 
 echo
+echo "== State volume =="
+# The question after a suspected volume loss is "is this the same CA my client's
+# profile embeds?". The fingerprint answers it; the modes answer "is the private
+# key world-readable".
+if [ -d "$STATE_DIR" ]; then
+    ls -l "$STATE_DIR" 2>/dev/null | sed 's/^/  /'
+    if [ -s "$STATE_DIR/server-cert.pem" ]; then
+        openssl x509 -in "$STATE_DIR/server-cert.pem" -noout -subject -dates -fingerprint -sha256 2>/dev/null \
+            | sed 's/^/  /'
+    fi
+    if [ -s "$STATE_DIR/ca-cert.pem" ]; then
+        openssl x509 -in "$STATE_DIR/ca-cert.pem" -noout -subject -fingerprint -sha256 2>/dev/null \
+            | sed 's/^/  CA: /'
+    fi
+else
+    echo "  ($STATE_DIR missing — state not generated yet)"
+fi
+
+echo
 echo "== Egress (via the chain) =="
 echo "  tun1 sends to socks ${CHAIN_SOCKS_HOST:-vpndogs-router}:${CHAIN_SOCKS_PORT:-1070}"
 

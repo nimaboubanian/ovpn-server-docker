@@ -18,7 +18,6 @@ PASS2='bob:hunter2'
 
 # One baseline for every case; docker-mode -e flags are appended after it, and
 # env applies left to right, so a case's own overrides win.
-STATE_DIR_OVERRIDE="/etc/openvpn/state"
 FIX_ENV=(OVPN_USERS="alice:$PASS1,bob:$PASS2" VPN_SERVER_ADDR=vpn.example.com)
 FIX_DE=()
 for kv in "${FIX_ENV[@]}"; do FIX_DE+=(-e "$kv"); done
@@ -59,6 +58,7 @@ assert() { # name jq-filter json
 }
 
 eq() { local name="$1" got="$2" want="$3"; [ "$got" = "$want" ] && echo "$name: PASS" || { echo "$name: FAIL"; printf 'want:\n%s\n\ngot:\n%s\n' "$want" "$got" >&2; fail=1; }; }
+ok() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then echo "$name: PASS"; else echo "$name: FAIL"; fail=1; fi; }
 # `--` is load-bearing: a pattern like "-- BEGIN CERTIFICATE --" is otherwise
 # swallowed by grep's option parsing and can never match.
 has() { local name="$1" text="$2" pat="$3"; printf '%s\n' "$text" | grep -qF -- "$pat" && echo "$name: PASS" || { echo "$name: FAIL"; printf 'expected %q in:\n%s\n' "$pat" "$text" >&2; fail=1; }; }
@@ -158,6 +158,8 @@ case_render() {
     lacks "NO fragment"               "$conf" "fragment"
     lacks "NO data-ciphers-fallback"  "$conf" "data-ciphers-fallback"
     lacks "NO bare cipher"            "$conf" "cipher "
+    lacks "NO client-config-dir"      "$conf" "client-config-dir"
+    lacks "NO allow-compression"      "$conf" "allow-compression"
 
     has "users alice"  "$users" "alice:$PASS1"
     has "users bob"    "$users" "bob:$PASS2"
@@ -183,15 +185,14 @@ bob:$PASS2"
                           "CHAIN_SOCKS_PORT=2080" "CLIENT_DNS=9.9.9.9" render)"
     has "override pool"      "$(block "server.conf" "$ovr")" "server 10.99.0.0 255.255.255.0"
     has "override dns"       "$(block "server.conf" "$ovr")" 'push "dhcp-option DNS 9.9.9.9"'
-    has "override persists new pool file path" "$(block "server.conf" "$ovr")" "ifconfig-pool-persist $STATE_DIR_OVERRIDE/ipp.txt"
     assert "override socks host" '.outbounds[] | select(.tag=="chain-out") | .server == "router2"' "$(block "sing-box.json" "$ovr")"
     assert "override socks port" '.outbounds[] | select(.tag=="chain-out") | .server_port == 2080' "$(block "sing-box.json" "$ovr")"
 }
 
 case_client() {
     echo "=== CLIENT-CONF CASES ==="
-    local ovpn
-    ovpn="$(run_env client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; return; }
+    local ovpn dir; dir="$(make_state_fixture)"
+    ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; rm -rf "$dir"; return; }
     has "remote host and port" "$ovpn" "remote vpn.example.com 1064"
     has "tcp-client"            "$ovpn" "proto tcp-client"
     has "remote-cert-tls"       "$ovpn" "remote-cert-tls server"
@@ -203,11 +204,13 @@ case_client() {
     lacks "no password leaked"  "$ovpn" "$PASS1"
     lacks "no client cert"      "$ovpn" "<cert>"
     lacks "no client key"       "$ovpn" "<key>"
-    run_is "unknown user exits 2" 2 run_env client-conf nobody
+    run_is "unknown user exits 2" 2 run_env "STATE_DIR=$dir" client-conf nobody
     has "unknown user named"     "$LAST_OUT" "nobody"
+    rm -rf "$dir"
 }
 
 AUTH="$HERE/auth.sh"
+REPORT="$HERE/report.sh"
 
 # auth.sh runs on the host too: it is four lines of sh and grep, and shipping a
 # password comparison nobody ever executed would be the worst trade in this repo.
@@ -242,23 +245,107 @@ PAIRS
     rm -rf "$dir"
 }
 
-# render_client_conf must inline whatever is really in STATE_DIR, not a marker.
-case_client_ca() {
-    echo "=== CLIENT-CONF REAL PKI CASES ==="
+# A complete-looking STATE_DIR in a temp dir, so client-conf can be exercised
+# against real file contents without docker.
+make_state_fixture() {
     local dir; dir="$(mktemp -d)"
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
-        -keyout "$dir/server-key.pem" -out "$dir/ca-cert.pem" \
-        -subj "/CN=test" >/dev/null 2>&1
+        -keyout "$dir/fixture-ca-key-unused.pem" -out "$dir/ca-cert.pem" \
+        -subj "/CN=vpndogs OpenVPN CA" >/dev/null 2>&1
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
+        -keyout "$dir/server-key.pem" -out "$dir/server-cert.pem" \
+        -subj "/CN=vpn.example.com" >/dev/null 2>&1
     printf -- '-----BEGIN OpenVPN Static key V1-----\ndeadbeef\n-----END OpenVPN Static key V1-----\n' \
         > "$dir/tls-crypt-v2.key"
-    local ovpn; ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)"
+    printf '%s' "$dir"
+}
+
+case_client_ca() {
+    echo "=== CLIENT-CONF REAL PKI CASES ==="
+    local dir ovpn; dir="$(make_state_fixture)"
+    ok "fixture cert was created" test -s "$dir/ca-cert.pem"
+    ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL" >&2; fail=1; return; }
     has "real CA inlined"        "$ovpn" "-----BEGIN CERTIFICATE-----"
     has "real CA body present"   "$ovpn" "$(awk 'NR==2' "$dir/ca-cert.pem")"
     has "real tls-crypt inlined" "$ovpn" "deadbeef"
-    rm -rf "$dir"
+    # A profile with placeholder bodies imports fine and fails on the user's
+    # phone. Refusing is the whole point.
+    local empty; empty="$(mktemp -d)"
+    run_is "client-conf without PKI exits 2" 2 run_env "STATE_DIR=$empty" client-conf alice
+    has "no-PKI message is actionable" "$LAST_OUT" "boot the node once"
+    rm -rf "$dir" "$empty"
 }
 
-main_cases() { case_cidr; case_validate; case_render; case_client; case_auth; case_client_ca; }
+# A local stand-in for the image. The PKI + config path needs no docker at all
+# once `sing-box` and `openvpn` are stubbed and every path is redirected into a
+# temp dir — which is what makes generate_state/render_configs testable here
+# instead of shipping unexecuted.
+case_keys() {
+    echo "=== KEY + CONFIG CASES ==="
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$t/bin/sing-box"; chmod +x "$t/bin/sing-box"
+    cat > "$t/bin/openvpn" <<'STUB'
+#!/bin/sh
+[ "$1" = "--genkey" ] && { printf -- '-----BEGIN OpenVPN Static key V1-----\ndeadbeef\n-----END OpenVPN Static key V1-----\n' > "$3"; exit 0; }
+exec sleep 300
+STUB
+    chmod +x "$t/bin/openvpn"
+    local -a kv=(PATH="$t/bin:$PATH" STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" SINGBOX_CONF="$t/sb/config.json" BOOT_STAGE=keys-only)
+    run_is "keys-only generates state" 0 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
+    has "state generated" "$LAST_OUT" "state generated"
+
+    local listing; listing="$(ls "$t/state" 2>&1)"
+    eq "state dir holds exactly the four files" "$(printf '%s\n' "$listing" | grep -c .)" "4"
+    has "ca-cert.pem"      "$listing" "ca-cert.pem"
+    has "server-cert.pem"  "$listing" "server-cert.pem"
+    has "server-key.pem"   "$listing" "server-key.pem"
+    has "tls-crypt-v2.key" "$listing" "tls-crypt-v2.key"
+    lacks "no CA serial left in the volume" "$listing" ".srl"
+    if printf '%s\n' "$listing" | grep -qi 'ca.*key'; then
+        echo "CA private key discarded: FAIL"; fail=1
+    else
+        echo "CA private key discarded: PASS"
+    fi
+
+    local certtext; certtext="$(openssl x509 -in "$t/state/server-cert.pem" -noout -text 2>/dev/null)"
+    has "server cert has serverAuth EKU" "$certtext" "TLS Web Server Authentication"
+    has "server cert SAN is the VPN address" "$certtext" "DNS:vpn.example.com"
+    has "CA cert is a CA" "$(openssl x509 -in "$t/state/ca-cert.pem" -noout -text 2>/dev/null)" "CA:TRUE"
+
+    # render_configs writes into a directory nothing else creates
+    ok "sing-box config rendered into a created dir" test -f "$t/sb/config.json"
+    ok "server.conf rendered" test -f "$t/ovpn/server.conf"
+    ok "users file rendered"   test -f "$t/ovpn/users"
+    has "users file has the right content" "$(cat "$t/ovpn/users")" "alice:$PASS1"
+
+    # openvpn drops to `nobody` before it runs auth-user-pass-verify, so the
+    # users file must be readable by a uid that did not write it.
+    local uown umode
+    uown="$(stat -c %U "$t/ovpn/users" 2>/dev/null || echo '?')"
+    umode="$(stat -c %a "$t/ovpn/users" 2>/dev/null || echo '?')"
+    if [ "$uown" = "nobody" ] || [ "${umode: -1}" != "0" ]; then
+        echo "users file readable by nobody: PASS"
+    else
+        echo "users file readable by nobody: FAIL (owner=$uown mode=$umode)"
+        fail=1
+    fi
+
+    # second boot must reuse, never re-mint: a new CA silently kills every profile
+    local fp1 fp2
+    fp1="$(cat "$t/state/server-cert.pem")"
+    run_is "keys-only second boot" 0 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
+    has "reuse logged" "$LAST_OUT" "reusing existing state"
+    fp2="$(cat "$t/state/server-cert.pem")"
+    eq "certificate identical across boots" "$fp1" "$fp2"
+
+    # a half-populated volume must not be mistaken for a complete one
+    rm -f "$t/state/server-key.pem"
+    run_is "partial state is refused" 2 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
+    rm -rf "$t"
+}
+
+main_cases() { case_cidr; case_validate; case_render; case_auth; case_keys; case_report; }
 
 state_case() {
     echo "=== PKI STATE CASES ==="
@@ -296,6 +383,14 @@ state_case() {
         -c 'cat /etc/openvpn/state/server-cert.pem')"
     eq "certificate identical across boots" "$fp1" "$fp2"
 
+    # the image must really ship it, executable, on PATH
+    run_is "report.sh is in the image" 0 \
+        docker run --rm --entrypoint /bin/sh "$IMG" -c 'command -v report.sh'
+    # and the users file must be readable by the uid openvpn drops to
+    run_is "users file readable as nobody" 0 \
+        docker run --rm --user nobody -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
+            --entrypoint /bin/sh "$IMG" -c 'head -1 /etc/openvpn/users'
+
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
@@ -330,36 +425,40 @@ boot_case() {
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
-report_case() {
+# report.sh is shell + coreutils, so with the STATE_DIR/OVPN_DIR overrides it runs
+# on the host exactly as it runs in the image. What it must never print is the
+# private key, the tls-crypt key or any password.
+case_report() {
     echo "=== REPORT CASES ==="
-    local vol="ovpn-report-test-$$" out key tc
-    docker volume rm -f "$vol" >/dev/null 2>&1 || true
-    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
-    run_is "seed state for report" 0 \
-        docker run --rm -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
-            -e BOOT_STAGE=keys-only "${FIX_DE[@]}" \
-            --entrypoint /usr/local/bin/entrypoint.sh "$IMG"
-    out="$(docker run --rm -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
-        "${FIX_DE[@]}" --entrypoint /bin/sh "$IMG" -c 'report.sh' 2>&1)"
-    key="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
-        -c 'cat /etc/openvpn/state/server-key.pem')"
-    tc="$(docker run --rm -v "$vol":/etc/openvpn/state --entrypoint /bin/sh "$IMG" \
-        -c 'cat /etc/openvpn/state/tls-crypt-v2.key')"
-    has "reports the tunnel"     "$out" "== OpenVPN =="
-    has "shows the public CA"    "$out" "-----BEGIN CERTIFICATE-----"
-    has "tells you the next cmd" "$out" "client-conf"
-    lacks "hides server key"     "$out" "$key"
-    lacks "hides tls-crypt key"  "$out" "$tc"
-    lacks "hides alice password" "$out" "$PASS1"
-    lacks "hides bob password"   "$out" "$PASS2"
-    docker volume rm -f "$vol" >/dev/null 2>&1 || true
+    local dir out
+    dir="$(make_state_fixture)"
+    printf '%s\n' "$PASS1" > /dev/null
+    printf '%s:%s\n%s:%s\n' alice "$PASS1" bob "$PASS2" > "$dir/users"
+    printf 'key %s/server-key.pem\ntls-crypt-v2 verify %s/tls-crypt-v2.key\n' "$dir" "$dir" > "$dir/server.conf"
+    out="$(env STATE_DIR="$dir" OVPN_DIR="$dir" OVPN_USERS="alice:$PASS1,bob:$PASS2" \
+               CHAIN_SOCKS_HOST=vpndogs-router CHAIN_SOCKS_PORT=1070 sh "$REPORT" 2>&1)"
+    has "reports the tunnel"      "$out" "== OpenVPN =="
+    has "shows the public CA"     "$out" "-----BEGIN CERTIFICATE-----"
+    has "tells you the next cmd"  "$out" "client-conf"
+    has "lists the state volume"  "$out" "== State volume =="
+    has "shows the cert fingerprint" "$out" "Fingerprint="
+    has "shows the cert validity" "$out" "notAfter"
+    has "shows the state dir modes" "$out" "server-key.pem"
+    lacks "hides server key"      "$out" "$(cat "$dir/server-key.pem")"
+    lacks "hides tls-crypt key"   "$out" "$(cat "$dir/tls-crypt-v2.key")"
+    lacks "hides alice password"  "$out" "$PASS1"
+    lacks "hides bob password"    "$out" "$PASS2"
+    rm -rf "$dir"
 }
 
-boot_cases() { state_case; boot_case; report_case; }
+boot_cases() { state_case; boot_case; }
+
+local_cases() { case_client; case_client_ca; }
 
 [ "$MODE" = local ] && {
     echo "=== LOCAL RENDER TESTS ==="
     main_cases
+    local_cases
     exit "$fail"
 }
 

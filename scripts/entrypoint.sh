@@ -186,6 +186,9 @@ render_client_conf() {
         [ "$name" = "$user" ] && found=1
     done
     [[ -n "$found" ]] || fatal "client-conf: '$user' is not in OVPN_USERS (known: $names)"
+    # A profile with placeholder bodies imports fine and then fails on connect,
+    # on the user's phone. Refuse instead.
+    state_is_complete || fatal "client-conf: no PKI in $STATE_DIR yet — boot the node once, then retry"
     cat <<EOF
 client
 dev tun
@@ -203,10 +206,10 @@ data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 verb 3
 
 <ca>
-$( [ -s "$STATE_DIR/ca-cert.pem" ] && cat "$STATE_DIR/ca-cert.pem" || echo "# placeholder: CA not generated yet" )
+$(cat "$STATE_DIR/ca-cert.pem")
 </ca>
 <tls-crypt-v2>
-$( [ -s "$STATE_DIR/tls-crypt-v2.key" ] && cat "$STATE_DIR/tls-crypt-v2.key" || echo "# placeholder: key not generated yet" )
+$(cat "$STATE_DIR/tls-crypt-v2.key")
 </tls-crypt-v2>
 EOF
 }
@@ -222,10 +225,24 @@ cmd_client_conf() { validate_env; render_client_conf "$@"; }
 
 # --- state ------------------------------------------------------------------
 
+state_is_complete() {
+    local f
+    for f in ca-cert.pem server-cert.pem server-key.pem tls-crypt-v2.key; do
+        [ -s "$STATE_DIR/$f" ] || return 1
+    done
+    return 0
+}
+
 generate_state() {
-    if [ -s "$STATE_DIR/ca-cert.pem" ] && [ -s "$STATE_DIR/tls-crypt-v2.key" ]; then
+    if state_is_complete; then
         log "reusing existing state in $STATE_DIR"
         return 0
+    fi
+    # A partial volume is never completed in place: minting a second CA beside an
+    # old cert would produce a state whose certificate no profile can verify.
+    if [ -e "$STATE_DIR" ] && [ -n "$(ls -A "$STATE_DIR" 2>/dev/null)" ]; then
+        log "state in $STATE_DIR is incomplete (missing $(cd "$STATE_DIR" && for f in ca-cert.pem server-cert.pem server-key.pem tls-crypt-v2.key; do [ -s "$f" ] || printf '%s ' "$f"; done))"
+        fatal "delete the ovpn-state volume to regenerate, then reissue every client profile"
     fi
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
@@ -240,7 +257,8 @@ generate_state() {
     openssl req -newkey rsa:3072 -nodes -keyout "$STATE_DIR/server-key.pem" \
         -out "$tmp/server.csr" -subj "/C=CH/O=vpndogs/CN=${VPN_SERVER_ADDR}" >/dev/null 2>&1
     openssl x509 -req -in "$tmp/server.csr" -CA "$STATE_DIR/ca-cert.pem" \
-        -CAkey "$tmp/ca-key.pem" -CAcreateserial -days 1095 -sha256 \
+        -CAkey "$tmp/ca-key.pem" -CAserial "$tmp/ca-cert.srl" -CAcreateserial \
+        -days 1095 -sha256 \
         -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s:%s\n' \
             "$san_type" "$VPN_SERVER_ADDR") \
         -out "$STATE_DIR/server-cert.pem" >/dev/null 2>&1
@@ -252,11 +270,18 @@ generate_state() {
 }
 
 render_configs() {
-    mkdir -p "$OVPN_DIR"
+    # dirname too: /etc/sing-box exists only because nothing else creates it, and
+    # a redirect into a missing directory kills the boot under `set -e`.
+    mkdir -p "$OVPN_DIR" "$(dirname "$SINGBOX_CONF")"
     render_server_conf  > "$OVPN_DIR/server.conf"
     render_singbox_conf > "$SINGBOX_CONF"
     render_users_file   > "$USERS_FILE"
-    chmod 600 "$OVPN_DIR/server.conf" "$USERS_FILE"
+    chmod 600 "$OVPN_DIR/server.conf"
+    # openvpn drops to `nobody` before running auth-user-pass-verify, so the
+    # users file must be readable by a uid that did not write it. chown needs
+    # root; if it cannot happen, fall back to a mode nobody can still read.
+    chmod 600 "$USERS_FILE"
+    chown nobody "$USERS_FILE" 2>/dev/null || chmod 644 "$USERS_FILE"
     sing-box check -c "$SINGBOX_CONF"
 }
 
