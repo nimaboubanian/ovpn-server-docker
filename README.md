@@ -64,7 +64,8 @@ There is nothing to generate and no key to copy. Issue a profile per user:
 docker exec vpndogs-ovpn-inbound entrypoint.sh client-conf alice > alice.ovpn
 ```
 
-The profile embeds the CA certificate and the `tls-crypt-v2` key, and it
+Each profile embeds the CA certificate and its **own** `tls-crypt-v2`
+client key — minted for that one user and useless to anyone else — and it
 carries **no password** — OpenVPN Connect prompts on connect. That is
 deliberate: the passwords live only in the server's `.env`, so a profile is
 safe to hand to a phone while credentials are not.
@@ -111,7 +112,8 @@ before anything else — nothing about OpenVPN is UDP-specific.
 
 **Handshake fails with a certificate error after the volume was recreated.**
 Losing `ovpn-state` mints a new CA, server certificate and `tls-crypt-v2`
-key, and every previously issued profile is dead. Re-issue them with
+server key, and every previously issued profile is dead — each profile's client
+key unwraps only under the server key it was issued against. Re-issue them with
 `client-conf`. This is the one failure mode that breaks all clients at once —
 see below.
 
@@ -133,8 +135,8 @@ hole, but a pool that overlaps *your LAN* still needs care.
 ## Volume loss
 
 `ovpn-state` holds the CA certificate, the server certificate and key, the
-`tls-crypt-v2` key, and `ipp.txt` (pool assignments, so client addresses
-survive a restart).
+`tls-crypt-v2` **server** key, and `ipp.txt` (pool assignments, so client
+addresses survive a restart).
 
 Deleting it is supported and idempotent — the node regenerates everything on
 the next boot — but it is destructive to clients:

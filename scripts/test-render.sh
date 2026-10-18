@@ -134,7 +134,8 @@ case_render() {
     has "pool persist"       "$conf" "ifconfig-pool-persist /etc/openvpn/state/ipp.txt"
     has "tun-mtu 1500"       "$conf" "tun-mtu 1500"
     has "dh none"            "$conf" "dh none"
-    has "tls-crypt-v2 verify" "$conf" "tls-crypt-v2 verify /etc/openvpn/state/tls-crypt-v2.key"
+    has "tls-crypt-v2 key"  "$conf" "tls-crypt-v2 /etc/openvpn/state/tls-crypt-v2.key"
+    lacks "no bogus verify keyword" "$conf" "tls-crypt-v2 verify"
     has "no client certs"    "$conf" "verify-client-cert none"
     has "auth SHA256"        "$conf" "auth SHA256"
     has "auth script"        "$conf" "auth-user-pass-verify /usr/local/bin/auth.sh file"
@@ -191,8 +192,9 @@ bob:$PASS2"
 
 case_client() {
     echo "=== CLIENT-CONF CASES ==="
-    local ovpn dir; dir="$(make_state_fixture)"
-    ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; rm -rf "$dir"; return; }
+    local ovpn dir stub; dir="$(make_state_fixture)"; stub="$(mktemp -d)"
+    make_stubs "$stub"
+    ovpn="$(PATH="$stub:$PATH" run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; rm -rf "$dir"; return; }
     has "remote host and port" "$ovpn" "remote vpn.example.com 1064"
     has "tcp-client"            "$ovpn" "proto tcp-client"
     has "remote-cert-tls"       "$ovpn" "remote-cert-tls server"
@@ -245,6 +247,25 @@ PAIRS
     rm -rf "$dir"
 }
 
+# Stub binaries so the PKI/keygen path runs on the host. `openvpn --genkey <type>
+# <file>` writes the key TYPE as its body, which is what lets a test tell a
+# server key from a per-client key by content.
+make_stubs() {
+    mkdir -p "$1"
+    printf '#!/bin/sh\nexit 0\n' > "$1/sing-box"; chmod +x "$1/sing-box"
+    cat > "$1/openvpn" <<'STUB'
+#!/bin/sh
+keytype=""; prev=""; out=""
+for a in "$@"; do
+    [ "$prev" = "--genkey" ] && keytype="$a"
+    out="$a"; prev="$a"
+done
+[ -n "$keytype" ] || exec sleep 300
+printf -- '-----BEGIN OpenVPN Static key V1-----\n%s\n-----END OpenVPN Static key V1-----\n' "$keytype" > "$out"
+STUB
+    chmod +x "$1/openvpn"
+}
+
 # A complete-looking STATE_DIR in a temp dir, so client-conf can be exercised
 # against real file contents without docker.
 make_state_fixture() {
@@ -262,12 +283,14 @@ make_state_fixture() {
 
 case_client_ca() {
     echo "=== CLIENT-CONF REAL PKI CASES ==="
-    local dir ovpn; dir="$(make_state_fixture)"
+    local dir ovpn stub; dir="$(make_state_fixture)"; stub="$(mktemp -d)"
+    make_stubs "$stub"
     ok "fixture cert was created" test -s "$dir/ca-cert.pem"
-    ovpn="$(run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL" >&2; fail=1; return; }
+    ovpn="$(PATH="$stub:$PATH" run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL" >&2; fail=1; return; }
     has "real CA inlined"        "$ovpn" "-----BEGIN CERTIFICATE-----"
     has "real CA body present"   "$ovpn" "$(awk 'NR==2' "$dir/ca-cert.pem")"
-    has "real tls-crypt inlined" "$ovpn" "deadbeef"
+    has "carries a per-client tls-crypt-v2 key" "$ovpn" "tls-crypt-v2-client"
+    lacks "never embeds the server key" "$ovpn" "deadbeef"
     # A profile with placeholder bodies imports fine and fails on the user's
     # phone. Refusing is the whole point.
     local empty; empty="$(mktemp -d)"
@@ -283,14 +306,7 @@ case_client_ca() {
 case_keys() {
     echo "=== KEY + CONFIG CASES ==="
     local t; t="$(mktemp -d)"
-    mkdir -p "$t/bin"
-    printf '#!/bin/sh\nexit 0\n' > "$t/bin/sing-box"; chmod +x "$t/bin/sing-box"
-    cat > "$t/bin/openvpn" <<'STUB'
-#!/bin/sh
-[ "$1" = "--genkey" ] && { printf -- '-----BEGIN OpenVPN Static key V1-----\ndeadbeef\n-----END OpenVPN Static key V1-----\n' > "$3"; exit 0; }
-exec sleep 300
-STUB
-    chmod +x "$t/bin/openvpn"
+    make_stubs "$t/bin"
     local -a kv=(PATH="$t/bin:$PATH" STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" SINGBOX_CONF="$t/sb/config.json" BOOT_STAGE=keys-only)
     run_is "keys-only generates state" 0 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
     has "state generated" "$LAST_OUT" "state generated"
@@ -320,16 +336,24 @@ STUB
     has "users file has the right content" "$(cat "$t/ovpn/users")" "alice:$PASS1"
 
     # openvpn drops to `nobody` before it runs auth-user-pass-verify, so the
-    # users file must be readable by a uid that did not write it.
-    local uown umode
+    # users file must be reachable by a uid that did not write it — both the
+    # file AND the directory it sits in (umask 077 would otherwise make
+    # /etc/openvpn 0700 and nobody unable to traverse into it).
+    local uown umode dmode dchar
     uown="$(stat -c %U "$t/ovpn/users" 2>/dev/null || echo '?')"
     umode="$(stat -c %a "$t/ovpn/users" 2>/dev/null || echo '?')"
+    dmode="$(stat -c %a "$t/ovpn" 2>/dev/null || echo '?')"
+    dchar="${dmode: -1}"
     if [ "$uown" = "nobody" ] || [ "${umode: -1}" != "0" ]; then
         echo "users file readable by nobody: PASS"
     else
         echo "users file readable by nobody: FAIL (owner=$uown mode=$umode)"
         fail=1
     fi
+    case "$dchar" in
+        1|3|5|7) echo "openvpn dir traversable by others: PASS" ;;
+        *) echo "openvpn dir traversable by others: FAIL (mode=$dmode — nobody cannot reach the users file)"; fail=1 ;;
+    esac
 
     # second boot must reuse, never re-mint: a new CA silently kills every profile
     local fp1 fp2
@@ -338,6 +362,9 @@ STUB
     has "reuse logged" "$LAST_OUT" "reusing existing state"
     fp2="$(cat "$t/state/server-cert.pem")"
     eq "certificate identical across boots" "$fp1" "$fp2"
+
+    # the state volume holds the SERVER key; profiles must never carry it
+    has "server key is a tls-crypt-v2-server key" "$(cat "$t/state/tls-crypt-v2.key")" "tls-crypt-v2-server"
 
     # a half-populated volume must not be mistaken for a complete one
     rm -f "$t/state/server-key.pem"
@@ -351,9 +378,12 @@ state_case() {
     echo "=== PKI STATE CASES ==="
     local vol="ovpn-state-test-$$"
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
-    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+    # double quotes on purpose: the EXIT trap fires after this function returns,
+    # so a single-quoted $vol would be unbound by then.
+    trap "docker volume rm -f '$vol' >/dev/null 2>&1 || true" EXIT
     run_is "keys-only first boot" 0 \
-        image_run -v "$vol":/etc/openvpn/state -e BOOT_STAGE=keys-only \
+        image_run -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
+            -e BOOT_STAGE=keys-only \
             --entrypoint /usr/local/bin/entrypoint.sh "$IMG"
     has "state generated" "$LAST_OUT" "state generated"
 
@@ -389,7 +419,8 @@ state_case() {
     # and the users file must be readable by the uid openvpn drops to
     run_is "users file readable as nobody" 0 \
         docker run --rm --user nobody -v "$vol":/etc/openvpn/state -v "$vol":/etc/openvpn \
-            --entrypoint /bin/sh "$IMG" -c 'head -1 /etc/openvpn/users'
+            --entrypoint /bin/sh "$IMG" \
+            -c 'head -1 /etc/openvpn/users || { echo "--- id ---"; id; echo "--- ls ---"; ls -lan /etc/openvpn; exit 1; }'
 
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
@@ -398,7 +429,9 @@ boot_case() {
     echo "=== BOOT CASES ==="
     local vol="ovpn-boot-test-$$"
     docker volume rm -f "$vol" >/dev/null 2>&1 || true
-    trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+    # double quotes on purpose: the EXIT trap fires after this function returns,
+    # so a single-quoted $vol would be unbound by then.
+    trap "docker volume rm -f '$vol' >/dev/null 2>&1 || true" EXIT
     run_is "live boot" 0 \
         docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
             -v "$vol":/etc/openvpn/state -e BOOT_STAGE=up-only \

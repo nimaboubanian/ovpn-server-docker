@@ -126,7 +126,7 @@ tun-mtu 1500
 cert $STATE_DIR/server-cert.pem
 key $STATE_DIR/server-key.pem
 dh none
-tls-crypt-v2 verify $STATE_DIR/tls-crypt-v2.key
+tls-crypt-v2 $STATE_DIR/tls-crypt-v2.key
 verify-client-cert none
 auth SHA256
 auth-user-pass-verify /usr/local/bin/auth.sh file
@@ -189,6 +189,15 @@ render_client_conf() {
     # A profile with placeholder bodies imports fine and then fails on connect,
     # on the user's phone. Refuse instead.
     state_is_complete || fatal "client-conf: no PKI in $STATE_DIR yet — boot the node once, then retry"
+    # A fresh per-client key every time: the server unwraps any of them with the
+    # one server key, and a profile that leaks gives away only that client.
+    local tc; tc="$(mktemp)"
+    if ! openvpn --tls-crypt-v2 "$STATE_DIR/tls-crypt-v2.key" \
+                  --genkey tls-crypt-v2-client "$tc"; then
+        rm -f "$tc"; fatal "client-conf: could not generate a tls-crypt-v2 client key"
+    fi
+    local tc_body; tc_body="$(cat "$tc")"
+    rm -f "$tc"
     cat <<EOF
 client
 dev tun
@@ -209,7 +218,7 @@ verb 3
 $(cat "$STATE_DIR/ca-cert.pem")
 </ca>
 <tls-crypt-v2>
-$(cat "$STATE_DIR/tls-crypt-v2.key")
+$tc_body
 </tls-crypt-v2>
 EOF
 }
@@ -264,7 +273,10 @@ generate_state() {
         -out "$STATE_DIR/server-cert.pem" >/dev/null 2>&1
     # The CA key has issued its one and only certificate; it is never needed again.
     rm -rf "$tmp"
-    openvpn --genkey secret "$STATE_DIR/tls-crypt-v2.key"
+    # tls-crypt-v2 is NOT the old shared static key: the server holds a wrapping
+    # key, and each client gets its own key wrapped under it. Profiles are issued
+    # one at a time by render_client_conf, which is why they can differ.
+    openvpn --genkey tls-crypt-v2-server "$STATE_DIR/tls-crypt-v2.key"
     chmod 600 "$STATE_DIR/server-key.pem" "$STATE_DIR/tls-crypt-v2.key"
     log "state generated in $STATE_DIR (CN/SAN=${VPN_SERVER_ADDR}, CA key discarded)"
 }
@@ -273,13 +285,15 @@ render_configs() {
     # dirname too: /etc/sing-box exists only because nothing else creates it, and
     # a redirect into a missing directory kills the boot under `set -e`.
     mkdir -p "$OVPN_DIR" "$(dirname "$SINGBOX_CONF")"
+    # 711, not 700: openvpn drops to `nobody` before running the auth script, and
+    # that script has to traverse INTO /etc/openvpn to read the users file.
+    # Traverse-only — the directory cannot be listed, and server.conf stays 600.
+    chmod 711 "$OVPN_DIR"
     render_server_conf  > "$OVPN_DIR/server.conf"
     render_singbox_conf > "$SINGBOX_CONF"
     render_users_file   > "$USERS_FILE"
     chmod 600 "$OVPN_DIR/server.conf"
-    # openvpn drops to `nobody` before running auth-user-pass-verify, so the
-    # users file must be readable by a uid that did not write it. chown needs
-    # root; if it cannot happen, fall back to a mode nobody can still read.
+    # the users file itself must be readable by that dropped uid too
     chmod 600 "$USERS_FILE"
     chown nobody "$USERS_FILE" 2>/dev/null || chmod 644 "$USERS_FILE"
     sing-box check -c "$SINGBOX_CONF"
