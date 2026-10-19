@@ -13,4 +13,4 @@ set -u
 USERS_FILE="${USERS_FILE:-/etc/openvpn/users}"
 [ $# -eq 1 ] && [ -r "$1" ] || exit 1
 cred="$(cat "$1")"
-grep -qxF -- "$(printf '%s' "$cred" | tr '\n' ':')" "$USERS_FILE"
+grep -qxF -- "$(printf '%s' "$cred" | tr '\n' ':')" "$USERS_FILE" || exit 1

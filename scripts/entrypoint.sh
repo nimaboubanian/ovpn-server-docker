@@ -129,7 +129,9 @@ ca $STATE_DIR/ca-cert.pem
 dh none
 tls-crypt-v2 $STATE_DIR/tls-crypt-v2.key
 verify-client-cert none
+username-as-common-name
 auth SHA256
+script-security 2
 auth-user-pass-verify /usr/local/bin/auth.sh via-file
 
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
@@ -147,7 +149,9 @@ verb 3
 user nobody
 group nobody
 
+block-ipv6
 push "redirect-gateway def1 bypass-dhcp ipv6"
+push "block-ipv6"
 push "dhcp-option DNS $CLIENT_DNS"
 EOF
 }
@@ -206,7 +210,6 @@ resolv-retry infinite
 nobind
 persist-key
 persist-tun
-route-ipv6
 remote-cert-tls server
 auth-user-pass
 auth-nocache

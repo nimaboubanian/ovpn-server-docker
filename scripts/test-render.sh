@@ -139,7 +139,9 @@ case_render() {
     has "tls-crypt-v2 key"   "$conf" "tls-crypt-v2 /etc/openvpn/state/tls-crypt-v2.key"
     lacks "no bogus verify keyword" "$conf" "tls-crypt-v2 verify"
     has "no client certs"    "$conf" "verify-client-cert none"
+    has "username as CN"     "$conf" "username-as-common-name"
     has "auth SHA256"        "$conf" "auth SHA256"
+    has "script-security 2"  "$conf" "script-security 2"
     has "auth script"        "$conf" "auth-user-pass-verify /usr/local/bin/auth.sh via-file"
     has "AEAD ciphers"       "$conf" "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
     has "client-to-client"   "$conf" "client-to-client"
@@ -149,7 +151,9 @@ case_render() {
     has "keepalive"          "$conf" "keepalive 10 60"
     has "drop privs user"    "$conf" "user nobody"
     has "drop privs group"   "$conf" "group nobody"
+    has "block-ipv6"         "$conf" "block-ipv6"
     has "redirect ipv4+ipv6" "$conf" 'push "redirect-gateway def1 bypass-dhcp ipv6"'
+    has "pushed block-ipv6"  "$conf" 'push "block-ipv6"'
     has "pushed DNS"         "$conf" 'push "dhcp-option DNS 1.1.1.1"'
     has "status file"        "$conf" "status /etc/openvpn/status.log 30"
     has "status version 1"   "$conf" "status-version 1"
@@ -196,11 +200,11 @@ case_client() {
     echo "=== CLIENT-CONF CASES ==="
     local ovpn dir stub; dir="$(make_state_fixture)"; stub="$(mktemp -d)"
     make_stubs "$stub"
-    ovpn="$(PATH="$stub:$PATH" run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; rm -rf "$dir"; return; }
+    ovpn="$(PATH="$stub:$PATH" run_env "STATE_DIR=$dir" client-conf alice)" || { echo "client-conf: FAIL (rc $?)" >&2; fail=1; rm -rf "$dir" "$stub"; return; }
     has "remote host and port" "$ovpn" "remote vpn.example.com 1064"
     has "tcp-client"            "$ovpn" "proto tcp-client"
     has "remote-cert-tls"       "$ovpn" "remote-cert-tls server"
-    has "route-ipv6"            "$ovpn" "route-ipv6"
+    lacks "no bare route-ipv6"  "$ovpn" "route-ipv6"
     has "auth-user-pass"        "$ovpn" "auth-user-pass"
     has "auth-nocache"          "$ovpn" "auth-nocache"
     has "inline ca"             "$ovpn" "<ca>"
@@ -210,7 +214,7 @@ case_client() {
     lacks "no client key"       "$ovpn" "<key>"
     run_is "unknown user exits 2" 2 run_env "STATE_DIR=$dir" client-conf nobody
     has "unknown user named"     "$LAST_OUT" "nobody"
-    rm -rf "$dir"
+    rm -rf "$dir" "$stub"
 }
 
 AUTH="$HERE/auth.sh"
@@ -246,6 +250,10 @@ PAIRS
     run_is "newline credential rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH" "$cred"
     run_is "no argument rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH"
     run_is "unreadable file rejects" 1 env USERS_FILE="$dir/users" sh "$AUTH" /nonexistent
+    # openvpn interprets exit 2 from auth-user-pass-verify as deferred auth, not
+    # rejection — missing USERS_FILE must exit 1, never grep's 2
+    printf 'alice\ns3cret\n' > "$cred"
+    run_is "missing users file exits 1 not 2" 1 env USERS_FILE="$dir/missing" sh "$AUTH" "$cred"
     rm -rf "$dir"
 }
 
@@ -502,9 +510,76 @@ case_report() {
     rm -rf "$dir"
 }
 
+case_handshake() {
+    echo "=== LIVE HANDSHAKE CASES ==="
+    if ! command -v openvpn >/dev/null 2>&1; then
+        echo "openvpn binary not on host: SKIP"
+        return
+    fi
+    local t port=18064 spid="" cpid="" i
+    t="$(mktemp -d)"
+    chmod 755 "$t"
+    printf '#!/bin/sh\nexit 0\n' > "$t/sing-box"; chmod +x "$t/sing-box"
+    env "${FIX_ENV[@]}" VPN_SERVER_ADDR=127.0.0.1 PATH="$t:$PATH" \
+        STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" SINGBOX_CONF="$t/sb/config.json" \
+        BOOT_STAGE=keys-only bash "$ENTRY" >/dev/null 2>&1
+
+    sed -e "s|/etc/openvpn/state|$t/state|g" \
+        -e "s|/etc/openvpn/status.log|$t/ovpn/status.log|g" \
+        -e "s|/usr/local/bin/auth.sh|$AUTH|g" \
+        -e "s|^port 1064|local 127.0.0.1\nport $port|" \
+        -e "s|^dev tun|dev null\nifconfig-noexec\nroute-noexec|" \
+        -e "/^user nobody/d" \
+        -e "/^group nobody/d" \
+        "$t/ovpn/server.conf" > "$t/ovpn/server-local.conf"
+
+    env "${FIX_ENV[@]}" VPN_SERVER_ADDR=127.0.0.1 STATE_DIR="$t/state" \
+        bash "$ENTRY" client-conf alice \
+        | sed -e "s|^remote 127.0.0.1 1064|remote 127.0.0.1 $port|" \
+              -e "s|^dev tun|dev null\nifconfig-noexec\nroute-noexec|" \
+              -e "s|^resolv-retry infinite|resolv-retry 1\nconnect-retry-max 1|" \
+        > "$t/client.ovpn"
+
+    USERS_FILE="$t/ovpn/users" openvpn --config "$t/ovpn/server-local.conf" \
+        --setenv USERS_FILE "$t/ovpn/users" > "$t/server.log" 2>&1 &
+    spid=$!
+    for i in $(seq 1 30); do
+        grep -q "Initialization Sequence Completed" "$t/server.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    has "server initialized" "$(cat "$t/server.log")" "Initialization Sequence Completed"
+
+    # 1. Wrong password must be rejected with AUTH_FAILED
+    printf 'alice\nwrongpass\n' > "$t/bad.cred"
+    openvpn --config "$t/client.ovpn" --auth-user-pass "$t/bad.cred" > "$t/bad.log" 2>&1 &
+    cpid=$!
+    for i in $(seq 1 40); do
+        grep -qE "AUTH_FAILED|Initialization Sequence Completed" "$t/bad.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    kill "$cpid" 2>/dev/null || true; wait "$cpid" 2>/dev/null || true
+    has "wrong password gets AUTH_FAILED" "$(cat "$t/bad.log")" "AUTH_FAILED"
+
+    # 2. Valid password must complete handshake and set CN to username
+    printf 'alice\n%s\n' "$PASS1" > "$t/good.cred"
+    openvpn --config "$t/client.ovpn" --auth-user-pass "$t/good.cred" > "$t/good.log" 2>&1 &
+    cpid=$!
+    for i in $(seq 1 40); do
+        grep -qE "AUTH_FAILED|Initialization Sequence Completed" "$t/good.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    kill "$cpid" 2>/dev/null || true; wait "$cpid" 2>/dev/null || true
+    kill "$spid" 2>/dev/null || true; wait "$spid" 2>/dev/null || true
+
+    has "valid password completes handshake" "$(cat "$t/good.log")" "Initialization Sequence Completed"
+    has "server sets CN to alice" "$(cat "$t/server.log")" "for username 'alice' [CN SET]"
+    lacks "no script-security warning" "$(cat "$t/server.log")" "disallowed by script-security"
+    rm -rf "$t"
+}
+
 boot_cases() { state_case; boot_case; }
 
-local_cases() { case_client; case_client_ca; }
+local_cases() { case_client; case_client_ca; case_handshake; }
 
 [ "$MODE" = local ] && {
     echo "=== LOCAL RENDER TESTS ==="

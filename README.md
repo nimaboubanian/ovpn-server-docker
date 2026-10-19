@@ -127,11 +127,11 @@ see below.
 are missing or empty. The container restart-loops; the rest of the stack is
 unaffected.
 
-**The client still leaks IPv6.** This node pushes
-`redirect-gateway def1 bypass-dhcp ipv6`, so a client's IPv6 goes into the
-tunnel where the server drops it — it fails closed. A profile missing
-`route-ipv6` will ignore that push and leak beside the tunnel; profiles from
-`client-conf` always include it.
+**The client still leaks IPv6.** This node sets `block-ipv6` and pushes both
+`block-ipv6` and `redirect-gateway def1 bypass-dhcp ipv6`, so a client's IPv6 is
+rejected with ICMPv6 `no route to host` instead of escaping beside the tunnel.
+If a hand-edited profile has `route-nopull` or `pull-filter ignore "block-ipv6"`,
+remove that override.
 
 **Everything black-holes after changing `OVPN_POOL`.** A pool overlapping the
 container's own subnet routes decrypted traffic back inside the netns. The
