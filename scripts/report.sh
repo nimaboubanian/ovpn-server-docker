@@ -8,8 +8,8 @@ STATE_DIR="${STATE_DIR:-/etc/openvpn/state}"
 OVPN_DIR="${OVPN_DIR:-/etc/openvpn}"
 
 echo "== Processes =="
-for p in openvpn sing-box; do
-    pid=$(pgrep -x "$p" 2>/dev/null | head -1)
+for p in openvpn hev-socks5-tunnel; do
+    pid=$(pgrep -f "^$p" 2>/dev/null | head -1)
     if [ -n "$pid" ]; then echo "  $p UP   pid=$pid"; else echo "  $p NOT RUNNING"; fi
 done
 for t in tun0 tun1; do

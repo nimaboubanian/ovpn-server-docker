@@ -19,10 +19,10 @@ LISTEN_PORT=1064
 STATE_DIR="${STATE_DIR:-/etc/openvpn/state}"
 OVPN_DIR="${OVPN_DIR:-/etc/openvpn}"
 USERS_FILE="${USERS_FILE:-$OVPN_DIR/users}"
-SINGBOX_CONF="${SINGBOX_CONF:-/etc/sing-box/config.json}"
+HEV_CONF="${HEV_CONF:-/etc/hev/config.yml}"
 ROUTER_TABLE=200
 TUN_VPN="tun0"     # owned by openvpn
-TUN_CHAIN="tun1"   # owned by sing-box
+TUN_CHAIN="tun1"   # owned by hev-socks5-tunnel
 
 declare -a USERS=()
 
@@ -154,23 +154,24 @@ push "dhcp-option DNS $CLIENT_DNS"
 EOF
 }
 
-render_singbox_conf() {
-    jq -n \
-        --arg tun "$TUN_CHAIN" \
-        --arg host "$CHAIN_SOCKS_HOST" \
-        --argjson port "$CHAIN_SOCKS_PORT" \
-        '{
-          log: {level: "warn"},
-          inbounds: [{
-            type: "tun", tag: "tun-in", interface_name: $tun,
-            address: ["198.18.0.1/30"], mtu: 1500,
-            auto_route: false, strict_route: false
-          }],
-          outbounds: [
-            {type: "socks", tag: "chain-out", server: $host, server_port: $port}
-          ],
-          route: {final: "chain-out"}
-        }'
+render_hev_conf() {
+    # Plain text: hev-socks5-tunnel has no config-check subcommand, so
+    # test-render.sh asserts the keys instead. udp: udp = SOCKS5 UDP ASSOCIATE,
+    # which is what the router's socks inbound speaks.
+    cat <<EOF
+tunnel:
+  name: $TUN_CHAIN
+  mtu: 1500
+  ipv4: 198.18.0.1
+
+socks5:
+  address: $CHAIN_SOCKS_HOST
+  port: $CHAIN_SOCKS_PORT
+  udp: udp
+
+misc:
+  log-level: warn
+EOF
 }
 
 render_users_file() {
@@ -226,7 +227,7 @@ EOF
 cmd_render() {
     validate_env
     echo "# === server.conf ==="; render_server_conf
-    echo "# === sing-box.json ==="; render_singbox_conf
+    echo "# === hev.yml ==="; render_hev_conf
     echo "# === users ==="; render_users_file
 }
 
@@ -288,21 +289,20 @@ generate_state() {
 }
 
 render_configs() {
-    # dirname too: /etc/sing-box exists only because nothing else creates it, and
+    # dirname too: /etc/hev exists only because nothing else creates it, and
     # a redirect into a missing directory kills the boot under `set -e`.
-    mkdir -p "$OVPN_DIR" "$(dirname "$SINGBOX_CONF")"
+    mkdir -p "$OVPN_DIR" "$(dirname "$HEV_CONF")"
     # 711, not 700: openvpn drops to `nobody` before running the auth script, and
     # that script has to traverse INTO /etc/openvpn to read the users file.
     # Traverse-only — the directory cannot be listed, and server.conf stays 600.
     chmod 711 "$OVPN_DIR"
     render_server_conf  > "$OVPN_DIR/server.conf"
-    render_singbox_conf > "$SINGBOX_CONF"
+    render_hev_conf > "$HEV_CONF"
     render_users_file   > "$USERS_FILE"
     chmod 600 "$OVPN_DIR/server.conf"
     # the users file itself must be readable by that dropped uid too
     chmod 600 "$USERS_FILE"
     chown nobody "$USERS_FILE" 2>/dev/null || chmod 644 "$USERS_FILE"
-    sing-box check -c "$SINGBOX_CONF"
 }
 
 main() {
@@ -312,16 +312,16 @@ main() {
     render_configs
     if [ "${BOOT_STAGE:-}" = keys-only ]; then exit 0; fi
     start_openvpn
-    start_singbox
+    start_hev
     install_routes
     if [ "${BOOT_STAGE:-}" = up-only ]; then exit 0; fi
     supervise
 }
 
 # --- boot -------------------------------------------------------------------
-# Boot order: openvpn first, then sing-box. It is the reverse of the siblings',
+# Boot order: openvpn first, then hev-socks5-tunnel. It is the reverse of the siblings',
 # and the reason is which process claims which interface name: openvpn creates
-# tun0 itself from its own `dev tun` + `server` directive, so sing-box is the one
+# tun0 itself from its own `dev tun` + `server` directive, so hev-socks5-tunnel is the one
 # that has to be told its name (`interface_name: tun1`).
 
 declare -A CHILD_PIDS=()
@@ -358,17 +358,17 @@ start_openvpn() {
     log "openvpn up, $TUN_VPN ready"
 }
 
-start_singbox() {
-    sing-box run -c "$SINGBOX_CONF" &
-    CHILD_PIDS[sing-box]=$!
+start_hev() {
+    hev-socks5-tunnel "$HEV_CONF" &
+    CHILD_PIDS[hev]=$!
     wait_for 15 ip link show "$TUN_CHAIN" \
         || { log "FATAL: $TUN_CHAIN never came up — check /dev/net/tun in compose"; exit 1; }
-    log "sing-box up, $TUN_CHAIN ready"
+    log "hev-socks5-tunnel up, $TUN_CHAIN ready"
 }
 
 # Policy routing, not auto_route: only decrypted pool-source traffic enters the
-# tun. openvpn's own TCP socket and sing-box's SOCKS traffic keep the normal
-# route. Idempotent, so it runs again after every sing-box restart.
+# tun. openvpn's own TCP socket and hev-socks5-tunnel's SOCKS traffic keep the normal
+# route. Idempotent, so it runs again after every hev-socks5-tunnel restart.
 install_routes() {
     ip rule del from "$OVPN_POOL" lookup "$ROUTER_TABLE" 2>/dev/null || true
     ip rule add from "$OVPN_POOL" lookup "$ROUTER_TABLE"
@@ -379,9 +379,9 @@ install_routes() {
 restart_child() {
     case "$1" in
         # a fresh tun needs its route back, or decrypted traffic is dropped
-        sing-box) start_singbox && install_routes ;;
+        hev)      start_hev && install_routes ;;
         # openvpn recreates tun0 and reapplies its own `server` directive, so the
-        # connected route returns with it; sing-box's tun never died
+        # connected route returns with it; hev-socks5-tunnel's tun never died
         openvpn)  start_openvpn ;;
     esac
 }

@@ -122,10 +122,10 @@ case_validate() {
 
 case_render() {
     echo "=== RENDER CASES ==="
-    local out conf sb users
+    local out conf hv users
     out="$(run_env render)" || { echo "render: FAIL (rc $?)" >&2; fail=1; return; }
     conf="$(block "server.conf" "$out")"
-    sb="$(block "sing-box.json" "$out")"
+    hv="$(block "hev.yml" "$out")"
     users="$(block "users" "$out")"
 
     has "proto tcp-server"   "$conf" "proto tcp-server"
@@ -172,13 +172,12 @@ case_render() {
     eq  "users in input order" "$users" "alice:$PASS1
 bob:$PASS2"
 
-    assert "sb interface_name tun1" '.inbounds[] | select(.type=="tun") | .interface_name == "tun1"' "$sb"
-    assert "sb mtu 1500"             '.inbounds[] | select(.type=="tun") | .mtu == 1500' "$sb"
-    assert "sb auto_route false"     '.inbounds[] | select(.type=="tun") | .auto_route == false' "$sb"
-    assert "sb route final socks"    '.route.final == "chain-out"' "$sb"
-    assert "sb socks target"         '.outbounds[] | select(.tag=="chain-out") | .server == "vpndogs-router"' "$sb"
-    assert "sb socks port"           '.outbounds[] | select(.tag=="chain-out") | .server_port == 1070' "$sb"
-    lacks "sb has no inert direct"  "$sb" "direct-out"
+    has "hev tun name tun1"    "$hv" "name: tun1"
+    has "hev mtu 1500"         "$hv" "mtu: 1500"
+    has "hev socks target"     "$hv" "address: vpndogs-router"
+    has "hev socks port"       "$hv" "port: 1070"
+    has "hev udp associate"    "$hv" "udp: udp"
+    lacks "hev no udp-in-tcp"  "$hv" "udp: tcp"
 
     # the teeth for Task 1's colon-password case: exit code alone could not
     # detect a password silently truncated at the second colon
@@ -191,8 +190,8 @@ bob:$PASS2"
                           "CHAIN_SOCKS_PORT=2080" "CLIENT_DNS=9.9.9.9" render)"
     has "override pool"      "$(block "server.conf" "$ovr")" "server 10.99.0.0 255.255.255.0"
     has "override dns"       "$(block "server.conf" "$ovr")" 'push "dhcp-option DNS 9.9.9.9"'
-    assert "override socks host" '.outbounds[] | select(.tag=="chain-out") | .server == "router2"' "$(block "sing-box.json" "$ovr")"
-    assert "override socks port" '.outbounds[] | select(.tag=="chain-out") | .server_port == 2080' "$(block "sing-box.json" "$ovr")"
+    has "override socks host" "$(block "hev.yml" "$ovr")" "address: router2"
+    has "override socks port" "$(block "hev.yml" "$ovr")" "port: 2080"
 }
 
 case_client() {
@@ -261,7 +260,7 @@ PAIRS
 # server key from a per-client key by content.
 make_stubs() {
     mkdir -p "$1"
-    printf '#!/bin/sh\nexit 0\n' > "$1/sing-box"; chmod +x "$1/sing-box"
+    printf '#!/bin/sh\nexit 0\n' > "$1/hev-socks5-tunnel"; chmod +x "$1/hev-socks5-tunnel"
     cat > "$1/openvpn" <<'STUB'
 #!/bin/sh
 keytype=""; prev=""; out=""
@@ -309,14 +308,14 @@ case_client_ca() {
 }
 
 # A local stand-in for the image. The PKI + config path needs no docker at all
-# once `sing-box` and `openvpn` are stubbed and every path is redirected into a
+# once `hev-socks5-tunnel` and `openvpn` are stubbed and every path is redirected into a
 # temp dir — which is what makes generate_state/render_configs testable here
 # instead of shipping unexecuted.
 case_keys() {
     echo "=== KEY + CONFIG CASES ==="
     local t; t="$(mktemp -d)"
     make_stubs "$t/bin"
-    local -a kv=(PATH="$t/bin:$PATH" STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" SINGBOX_CONF="$t/sb/config.json" BOOT_STAGE=keys-only)
+    local -a kv=(PATH="$t/bin:$PATH" STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" HEV_CONF="$t/sb/config.json" BOOT_STAGE=keys-only)
     run_is "keys-only generates state" 0 env "${FIX_ENV[@]}" "${kv[@]}" bash "$ENTRY"
     has "state generated" "$LAST_OUT" "state generated"
 
@@ -339,7 +338,7 @@ case_keys() {
     has "CA cert is a CA" "$(openssl x509 -in "$t/state/ca-cert.pem" -noout -text 2>/dev/null)" "CA:TRUE"
 
     # render_configs writes into a directory nothing else creates
-    ok "sing-box config rendered into a created dir" test -f "$t/sb/config.json"
+    ok "hev config rendered into a created dir" test -f "$t/sb/config.json"
     ok "server.conf rendered" test -f "$t/ovpn/server.conf"
     ok "users file rendered"   test -f "$t/ovpn/users"
     has "users file has the right content" "$(cat "$t/ovpn/users")" "alice:$PASS1"
@@ -386,7 +385,7 @@ case_keys() {
     printf '#!/bin/sh\n' > "$t3/state/up.sh"
     run_is "unrelated files do not block generation" 0 \
         env "${FIX_ENV[@]}" PATH="$t/bin:$PATH" STATE_DIR="$t3/state" \
-            OVPN_DIR="$t3/ovpn" SINGBOX_CONF="$t3/sb/config.json" \
+            OVPN_DIR="$t3/ovpn" HEV_CONF="$t3/sb/config.json" \
             BOOT_STAGE=keys-only bash "$ENTRY"
     rm -rf "$t" "$t3"
 }
@@ -462,14 +461,14 @@ boot_case() {
              ip link show tun0 >/dev/null && echo MARK-TUN0 &&
              ip link show tun1 >/dev/null && echo MARK-TUN1 &&
              pgrep -x openvpn  >/dev/null && echo MARK-OPENVPN &&
-             pgrep -x sing-box >/dev/null && echo MARK-SINGBOX &&
+             pgrep -f ^hev-socks5-tunnel >/dev/null && echo MARK-HEV &&
              ip rule && ip route show table 200'
     # Explicit markers, not substring hunts: a failed boot still prints
     # 'Device "tun0" does not exist', which a `has "tun0"` would match.
     has "tun0 up"         "$LAST_OUT" "MARK-TUN0"
     has "tun1 up"         "$LAST_OUT" "MARK-TUN1"
     has "openvpn running"  "$LAST_OUT" "MARK-OPENVPN"
-    has "sing-box running" "$LAST_OUT" "MARK-SINGBOX"
+    has "hev running" "$LAST_OUT" "MARK-HEV"
     has "policy rule"  "$LAST_OUT" "from 10.10.40.0/24 lookup 200"
     has "default into chain tun" "$LAST_OUT" "default dev tun1"
 
@@ -518,9 +517,9 @@ case_handshake() {
     local t port=18064 spid="" cpid="" i
     t="$(mktemp -d)"
     chmod 755 "$t"
-    printf '#!/bin/sh\nexit 0\n' > "$t/sing-box"; chmod +x "$t/sing-box"
+    printf '#!/bin/sh\nexit 0\n' > "$t/hev-socks5-tunnel"; chmod +x "$t/hev-socks5-tunnel"
     env "${FIX_ENV[@]}" VPN_SERVER_ADDR=127.0.0.1 PATH="$t:$PATH" \
-        STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" SINGBOX_CONF="$t/sb/config.json" \
+        STATE_DIR="$t/state" OVPN_DIR="$t/ovpn" HEV_CONF="$t/sb/config.json" \
         BOOT_STAGE=keys-only bash "$ENTRY" >/dev/null 2>&1
 
     sed -e "s|/etc/openvpn/state|$t/state|g" \
