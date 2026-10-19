@@ -151,9 +151,8 @@ case_render() {
     has "keepalive"          "$conf" "keepalive 10 60"
     has "drop privs user"    "$conf" "user nobody"
     has "drop privs group"   "$conf" "group nobody"
-    has "block-ipv6"         "$conf" "block-ipv6"
-    has "redirect ipv4+ipv6" "$conf" 'push "redirect-gateway def1 bypass-dhcp ipv6"'
-    has "pushed block-ipv6"  "$conf" 'push "block-ipv6"'
+    has "redirect ipv4"      "$conf" 'push "redirect-gateway def1 bypass-dhcp"'
+    lacks "NO ipv6 in server" "$conf" "ipv6"
     has "pushed DNS"         "$conf" 'push "dhcp-option DNS 1.1.1.1"'
     has "status file"        "$conf" "status /etc/openvpn/status.log 30"
     has "status version 1"   "$conf" "status-version 1"

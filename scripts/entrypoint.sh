@@ -149,9 +149,7 @@ verb 3
 user nobody
 group nobody
 
-block-ipv6
-push "redirect-gateway def1 bypass-dhcp ipv6"
-push "block-ipv6"
+push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS $CLIENT_DNS"
 EOF
 }

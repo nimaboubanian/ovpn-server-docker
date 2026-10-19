@@ -127,11 +127,9 @@ see below.
 are missing or empty. The container restart-loops; the rest of the stack is
 unaffected.
 
-**The client still leaks IPv6.** This node sets `block-ipv6` and pushes both
-`block-ipv6` and `redirect-gateway def1 bypass-dhcp ipv6`, so a client's IPv6 is
-rejected with ICMPv6 `no route to host` instead of escaping beside the tunnel.
-If a hand-edited profile has `route-nopull` or `pull-filter ignore "block-ipv6"`,
-remove that override.
+**IPv6.** This node is IPv4-only and emits no IPv6 directives, so profiles
+import into any OpenVPN client. A dual-stack client network can still leak IPv6
+beside the tunnel; disable IPv6 on the client network (or APN) if that matters.
 
 **Everything black-holes after changing `OVPN_POOL`.** A pool overlapping the
 container's own subnet routes decrypted traffic back inside the netns. The
